@@ -50,10 +50,10 @@ body:
   - type: textarea
     id: logs
     attributes:
-    label: Log File
-    description: |
-      Drag & drop your log file here, or paste the log contents.
+      label: Log File
+      description: |
+        Drag & drop your log file here, or paste the log contents.
 
-      Supported: .log / .txt / .zip
-      Large logs should be uploaded as a file.
-    render: shell
+        Supported: .log / .txt / .zip
+        Large logs should be uploaded as a file.
+      render: shell
