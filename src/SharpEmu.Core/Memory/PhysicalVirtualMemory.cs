@@ -222,6 +222,56 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         return actualAddress;
     }
 
+    public bool TryAllocateAtOrAbove(
+        ulong desiredAddress,
+        ulong size,
+        bool executable,
+        ulong alignment,
+        out ulong actualAddress)
+    {
+        actualAddress = 0;
+        if (size == 0)
+        {
+            return false;
+        }
+
+        var alignedSize = AlignUp(size, PageSize);
+        var effectiveAlignment = Math.Max(PageSize, alignment == 0 ? PageSize : alignment);
+        var cursor = AlignUp(desiredAddress, effectiveAlignment);
+
+        for (var attempt = 0; attempt < 0x10000; attempt++)
+        {
+            if (cursor == 0 || ulong.MaxValue - cursor < alignedSize)
+            {
+                return false;
+            }
+
+            if (TryGetOverlappingRegionEnd(cursor, alignedSize, out var overlapEnd))
+            {
+                cursor = AlignUp(overlapEnd, effectiveAlignment);
+                continue;
+            }
+
+            try
+            {
+                actualAddress = AllocateAt(cursor, alignedSize, executable, allowAlternative: false);
+                if (actualAddress == cursor)
+                {
+                    return true;
+                }
+
+                actualAddress = 0;
+            }
+            catch
+            {
+            }
+
+            cursor = AlignUp(cursor + effectiveAlignment, effectiveAlignment);
+        }
+
+        return false;
+    }
+
     public bool TryAllocateGuestMemory(ulong size, ulong alignment, out ulong address)
     {
         address = 0;
@@ -530,6 +580,30 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             }
         }
         return null;
+    }
+
+    private bool TryGetOverlappingRegionEnd(ulong address, ulong size, out ulong overlapEnd)
+    {
+        overlapEnd = 0;
+        if (size == 0 || ulong.MaxValue - address < size - 1)
+        {
+            return false;
+        }
+
+        var end = address + size;
+        lock (_gate)
+        {
+            foreach (var region in _regions)
+            {
+                var regionEnd = region.VirtualAddress + region.Size;
+                if (address < regionEnd && region.VirtualAddress < end)
+                {
+                    overlapEnd = Math.Max(overlapEnd, regionEnd);
+                }
+            }
+        }
+
+        return overlapEnd != 0;
     }
 
     private static bool TryResolveRegionOffset(ulong address, ulong size, MemoryRegion region, out ulong offset)

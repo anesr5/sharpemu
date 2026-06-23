@@ -36,11 +36,13 @@ public interface IGuestThreadScheduler
 public readonly record struct GuestImportCallFrame(
     bool IsValid,
     ulong ReturnRip,
-    ulong ResumeRsp);
+    ulong ResumeRsp,
+    ulong ReturnSlotAddress);
 
 public readonly record struct GuestCpuContinuation(
     ulong Rip,
     ulong Rsp,
+    ulong ReturnSlotAddress,
     ulong Rflags,
     ulong FsBase,
     ulong GsBase,
@@ -64,6 +66,9 @@ public static class GuestThreadExecution
     private static ulong _currentGuestThreadHandle;
 
     [ThreadStatic]
+    private static ulong _currentFiberAddress;
+
+    [ThreadStatic]
     private static string? _pendingBlockReason;
 
     [ThreadStatic]
@@ -84,11 +89,16 @@ public static class GuestThreadExecution
     [ThreadStatic]
     private static ulong _currentImportResumeRsp;
 
+    [ThreadStatic]
+    private static ulong _currentImportReturnSlotAddress;
+
     public static IGuestThreadScheduler? Scheduler { get; set; }
 
     public static bool IsGuestThread => _currentGuestThreadHandle != 0;
 
     public static ulong CurrentGuestThreadHandle => _currentGuestThreadHandle;
+
+    public static ulong CurrentFiberAddress => _currentFiberAddress;
 
     public static ulong EnterGuestThread(ulong threadHandle)
     {
@@ -101,6 +111,7 @@ public static class GuestThreadExecution
         _hasCurrentImportCallFrame = false;
         _currentImportReturnRip = 0;
         _currentImportResumeRsp = 0;
+        _currentImportReturnSlotAddress = 0;
         return previous;
     }
 
@@ -114,6 +125,19 @@ public static class GuestThreadExecution
         _hasCurrentImportCallFrame = false;
         _currentImportReturnRip = 0;
         _currentImportResumeRsp = 0;
+        _currentImportReturnSlotAddress = 0;
+    }
+
+    public static ulong EnterFiber(ulong fiberAddress)
+    {
+        var previous = _currentFiberAddress;
+        _currentFiberAddress = fiberAddress;
+        return previous;
+    }
+
+    public static void RestoreFiber(ulong previousFiberAddress)
+    {
+        _currentFiberAddress = previousFiberAddress;
     }
 
     public static bool RequestCurrentThreadBlock(string reason)
@@ -161,15 +185,20 @@ public static class GuestThreadExecution
         return true;
     }
 
-    public static GuestImportCallFrame EnterImportCallFrame(ulong returnRip, ulong resumeRsp)
+    public static GuestImportCallFrame EnterImportCallFrame(
+        ulong returnRip,
+        ulong resumeRsp,
+        ulong returnSlotAddress)
     {
         var previous = new GuestImportCallFrame(
             _hasCurrentImportCallFrame,
             _currentImportReturnRip,
-            _currentImportResumeRsp);
+            _currentImportResumeRsp,
+            _currentImportReturnSlotAddress);
         _hasCurrentImportCallFrame = true;
         _currentImportReturnRip = returnRip;
         _currentImportResumeRsp = resumeRsp;
+        _currentImportReturnSlotAddress = returnSlotAddress;
         return previous;
     }
 
@@ -178,6 +207,7 @@ public static class GuestThreadExecution
         _hasCurrentImportCallFrame = previous.IsValid;
         _currentImportReturnRip = previous.ReturnRip;
         _currentImportResumeRsp = previous.ResumeRsp;
+        _currentImportReturnSlotAddress = previous.ReturnSlotAddress;
     }
 
     public static bool TryGetCurrentImportCallFrame(out GuestImportCallFrame frame)
@@ -188,7 +218,11 @@ public static class GuestThreadExecution
             return false;
         }
 
-        frame = new GuestImportCallFrame(true, _currentImportReturnRip, _currentImportResumeRsp);
+        frame = new GuestImportCallFrame(
+            true,
+            _currentImportReturnRip,
+            _currentImportResumeRsp,
+            _currentImportReturnSlotAddress);
         return true;
     }
 }

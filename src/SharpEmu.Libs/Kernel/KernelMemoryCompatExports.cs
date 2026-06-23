@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.Libs.Ampr;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
 using System.Threading;
@@ -164,7 +165,7 @@ public static class KernelMemoryCompatExports
             var desiredAddress = AlignUp(
                 _nextVirtualAddress == 0 ? 0x1_0000_0000UL : _nextVirtualAddress,
                 effectiveAlignment);
-            if (!TryReserveGuestVirtualRange(ctx, desiredAddress, mappedLength, OrbisProtCpuReadWrite, out address) ||
+            if (!TryReserveGuestVirtualRange(ctx, desiredAddress, mappedLength, OrbisProtCpuReadWrite, effectiveAlignment, out address) ||
                 address == 0)
             {
                 return false;
@@ -597,7 +598,6 @@ public static class KernelMemoryCompatExports
             ulong NextGpArg() => vaCursor.NextGpArg();
             double NextFloatArg() => vaCursor.NextFloatArg();
             rendered = FormatString(ctx, format, NextGpArg, NextFloatArg);
-            vaCursor.Commit();
         }
 
         Console.Write(rendered);
@@ -2242,7 +2242,7 @@ public static class KernelMemoryCompatExports
             }
             else
             {
-                reserved = TryReserveGuestVirtualRange(ctx, desiredAddress, length, protection, out mappedAddress);
+                reserved = TryReserveGuestVirtualRange(ctx, desiredAddress, length, protection, effectiveAlignment, out mappedAddress);
             }
             if (ShouldTraceDirectMemory())
             {
@@ -2331,7 +2331,7 @@ public static class KernelMemoryCompatExports
             {
                 mappedAddress = requestedAddress;
             }
-            else if (!TryReserveGuestVirtualRange(ctx, desiredAddress, length, protection, out mappedAddress))
+            else if (!TryReserveGuestVirtualRange(ctx, desiredAddress, length, protection, OrbisPageSize, out mappedAddress))
             {
                 mappedAddress = requestedAddress != 0 && fixedMapping
                     ? requestedAddress
@@ -2721,7 +2721,6 @@ public static class KernelMemoryCompatExports
         ulong NextGpArg() => vaCursor.NextGpArg();
         double NextFloatArg() => vaCursor.NextFloatArg();
         var rendered = FormatString(ctx, format, NextGpArg, NextFloatArg);
-        vaCursor.Commit();
 
         var outputBytes = Encoding.UTF8.GetBytes(rendered);
         return WriteSnprintfOutput(ctx, destination, bufferSize, outputBytes);
@@ -2768,7 +2767,6 @@ public static class KernelMemoryCompatExports
             ulong NextGpArg() => vaCursor.NextGpArg();
             double NextFloatArg() => vaCursor.NextFloatArg();
             rendered = FormatString(ctx, format, NextGpArg, NextFloatArg);
-            vaCursor.Commit();
         }
 
         TraceWidePrintf(ctx, "vswprintf", destination, bufferSize, format, rendered);
@@ -3552,13 +3550,6 @@ public static class KernelMemoryCompatExports
                 : 0.0;
         }
 
-        public void Commit()
-        {
-            _ = TryWriteUInt32Compat(_ctx, _vaListAddress + 0, _gpOffset);
-            _ = TryWriteUInt32Compat(_ctx, _vaListAddress + 4, _fpOffset);
-            _ = TryWriteUInt64Compat(_ctx, _vaListAddress + 8, _overflowArgArea);
-        }
-
         public uint GpOffset => _gpOffset;
 
         public uint FpOffset => _fpOffset;
@@ -3613,6 +3604,7 @@ public static class KernelMemoryCompatExports
         ulong desiredAddress,
         ulong length,
         int protection,
+        ulong alignment,
         out ulong mappedAddress)
     {
         mappedAddress = 0;
@@ -3625,40 +3617,51 @@ public static class KernelMemoryCompatExports
         {
             object memoryObject = ctx.Memory;
             MethodInfo? allocateAt = null;
+            MethodInfo? allocateAtOrAbove = null;
             var allocateAtHasAllowAlternativeArg = false;
             for (var depth = 0; depth < 4; depth++)
             {
                 foreach (var candidate in memoryObject.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
                 {
-                    if (!string.Equals(candidate.Name, "AllocateAt", StringComparison.Ordinal))
-                    {
-                        continue;
-                    }
-
                     var parameters = candidate.GetParameters();
-                    if (parameters.Length == 3 &&
-                        parameters[0].ParameterType == typeof(ulong) &&
-                        parameters[1].ParameterType == typeof(ulong) &&
-                        parameters[2].ParameterType == typeof(bool))
-                    {
-                        allocateAt = candidate;
-                        allocateAtHasAllowAlternativeArg = false;
-                        break;
-                    }
-
-                    if (parameters.Length == 4 &&
+                    if (string.Equals(candidate.Name, "TryAllocateAtOrAbove", StringComparison.Ordinal) &&
+                        parameters.Length == 5 &&
                         parameters[0].ParameterType == typeof(ulong) &&
                         parameters[1].ParameterType == typeof(ulong) &&
                         parameters[2].ParameterType == typeof(bool) &&
-                        parameters[3].ParameterType == typeof(bool))
+                        parameters[3].ParameterType == typeof(ulong) &&
+                        parameters[4].ParameterType == typeof(ulong).MakeByRefType())
                     {
-                        allocateAt = candidate;
-                        allocateAtHasAllowAlternativeArg = true;
+                        allocateAtOrAbove = candidate;
+                    }
+                    else if (string.Equals(candidate.Name, "AllocateAt", StringComparison.Ordinal))
+                    {
+                        if (parameters.Length == 3 &&
+                            parameters[0].ParameterType == typeof(ulong) &&
+                            parameters[1].ParameterType == typeof(ulong) &&
+                            parameters[2].ParameterType == typeof(bool))
+                        {
+                            allocateAt = candidate;
+                            allocateAtHasAllowAlternativeArg = false;
+                        }
+                        else if (parameters.Length == 4 &&
+                            parameters[0].ParameterType == typeof(ulong) &&
+                            parameters[1].ParameterType == typeof(ulong) &&
+                            parameters[2].ParameterType == typeof(bool) &&
+                            parameters[3].ParameterType == typeof(bool))
+                        {
+                            allocateAt = candidate;
+                            allocateAtHasAllowAlternativeArg = true;
+                        }
+                    }
+
+                    if (allocateAtOrAbove is not null && allocateAt is not null)
+                    {
                         break;
                     }
                 }
 
-                if (allocateAt is not null)
+                if (allocateAtOrAbove is not null || allocateAt is not null)
                 {
                     break;
                 }
@@ -3678,15 +3681,27 @@ public static class KernelMemoryCompatExports
                 memoryObject = innerValue;
             }
 
+            var executable = (protection & OrbisProtCpuExec) != 0;
+            if (allocateAtOrAbove is not null)
+            {
+                var searchArgs = new object[] { desiredAddress, length, executable, alignment, 0UL };
+                var searchResult = allocateAtOrAbove.Invoke(memoryObject, searchArgs);
+                if (searchResult is bool trueValue && trueValue &&
+                    searchArgs[4] is ulong searchedAddress && searchedAddress != 0)
+                {
+                    mappedAddress = searchedAddress;
+                    return true;
+                }
+            }
+
             if (allocateAt is null)
             {
                 Console.Error.WriteLine($"[LOADER][TRACE] reserve range: AllocateAt missing on {ctx.Memory.GetType().FullName}");
                 return false;
             }
 
-            var executable = (protection & OrbisProtCpuExec) != 0;
             var invokeArgs = allocateAtHasAllowAlternativeArg
-                ? new object[] { desiredAddress, length, executable, true }
+                ? new object[] { desiredAddress, length, executable, false }
                 : new object[] { desiredAddress, length, executable };
             var result = allocateAt.Invoke(memoryObject, invokeArgs);
             if (result is not ulong allocated || allocated == 0)
@@ -3960,32 +3975,81 @@ public static class KernelMemoryCompatExports
 
     private static bool TryReadCString(CpuContext ctx, ulong address, ulong maxLength, out byte[] bytes)
     {
+        return TryReadBytesUntilNull(ctx, address, maxLength, 1_048_576, out bytes);
+    }
+
+    private static bool TryReadBytesUntilNull(
+        CpuContext ctx,
+        ulong address,
+        ulong maxLength,
+        int hardLimit,
+        out byte[] bytes)
+    {
         bytes = Array.Empty<byte>();
         if (address == 0)
         {
             return false;
         }
 
-        var limit = (int)Math.Min(maxLength, 1_048_576UL);
-        var buffer = new List<byte>(Math.Min(limit, 256));
-        Span<byte> one = stackalloc byte[1];
-        for (var i = 0; i < limit; i++)
+        var limit = (int)Math.Min(maxLength, (ulong)Math.Max(0, hardLimit));
+        if (limit == 0)
         {
-            if (!TryReadCompat(ctx, address + (ulong)i, one))
+            return true;
+        }
+
+        const int maxChunkSize = 4096;
+        var chunk = GC.AllocateUninitializedArray<byte>(Math.Min(maxChunkSize, limit));
+        var writer = new ArrayBufferWriter<byte>(Math.Min(limit, 256));
+        ulong offset = 0;
+        while (offset < (ulong)limit)
+        {
+            var current = address + offset;
+            if (current < address)
+            {
+                return false;
+            }
+
+            var pageRemaining = maxChunkSize - (int)(current & (maxChunkSize - 1));
+            var remaining = (int)Math.Min((ulong)limit - offset, (ulong)Math.Min(chunk.Length, pageRemaining));
+            var span = chunk.AsSpan(0, remaining);
+            if (TryReadCompat(ctx, current, span))
+            {
+                var nulIndex = span.IndexOf((byte)0);
+                var copyLength = nulIndex >= 0 ? nulIndex : remaining;
+                if (copyLength > 0)
+                {
+                    span[..copyLength].CopyTo(writer.GetSpan(copyLength));
+                    writer.Advance(copyLength);
+                }
+
+                if (nulIndex >= 0)
+                {
+                    bytes = writer.WrittenSpan.ToArray();
+                    return true;
+                }
+
+                offset += (ulong)remaining;
+                continue;
+            }
+
+            Span<byte> one = stackalloc byte[1];
+            if (!TryReadCompat(ctx, current, one))
             {
                 return false;
             }
 
             if (one[0] == 0)
             {
-                bytes = buffer.ToArray();
+                bytes = writer.WrittenSpan.ToArray();
                 return true;
             }
 
-            buffer.Add(one[0]);
+            one.CopyTo(writer.GetSpan(1));
+            writer.Advance(1);
+            offset++;
         }
 
-        bytes = buffer.ToArray();
+        bytes = writer.WrittenSpan.ToArray();
         return true;
     }
 
@@ -4165,25 +4229,12 @@ public static class KernelMemoryCompatExports
             return false;
         }
 
-        var buffer = new List<byte>(Math.Min(maxLength, 256));
-        Span<byte> one = stackalloc byte[1];
-        for (var i = 0; i < maxLength; i++)
+        if (!TryReadBytesUntilNull(ctx, address, (ulong)maxLength, maxLength, out var bytes))
         {
-            if (!TryReadCompat(ctx, address + (ulong)i, one))
-            {
-                return false;
-            }
-
-            if (one[0] == 0)
-            {
-                value = Encoding.UTF8.GetString(buffer.ToArray());
-                return true;
-            }
-
-            buffer.Add(one[0]);
+            return false;
         }
 
-        value = Encoding.UTF8.GetString(buffer.ToArray());
+        value = Encoding.UTF8.GetString(bytes);
         return true;
     }
 

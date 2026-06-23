@@ -143,6 +143,8 @@ public sealed partial class DirectExecutionBackend
 			ProbeReturnRip(num7, num);
 		}
 		TrackStrlenPrelude(importStubEntry.Nid, num, num7);
+		TraceGuestContext(
+			$"import dispatch={num} nid={importStubEntry.Nid} ret=0x{num7:X16} managed={Environment.CurrentManagedThreadId} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} fiber=0x{GuestThreadExecution.CurrentFiberAddress:X16} active={HasActiveExecutionThread}");
 		bool logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
 		if (logBootstrap && string.Equals(importStubEntry.Nid, RuntimeStubNids.BootstrapBridge, StringComparison.Ordinal))
 		{
@@ -279,13 +281,15 @@ public sealed partial class DirectExecutionBackend
 			catch
 			{
 			}
-			TryBypassStackChkFailTrap(num, num7);
 		}
 		try
 		{
 			OrbisGen2Result orbisGen2Result;
 			bool dispatchResolved = true;
-			var previousImportCallFrame = GuestThreadExecution.EnterImportCallFrame(num7, (ulong)argPackPtr + 104uL);
+			var previousImportCallFrame = GuestThreadExecution.EnterImportCallFrame(
+				num7,
+				(ulong)argPackPtr + 104uL,
+				ActiveGuestReturnSlotAddress);
 			try
 			{
 				if (string.Equals(importStubEntry.Nid, RuntimeStubNids.BootstrapBridge, StringComparison.Ordinal))
@@ -408,7 +412,7 @@ public sealed partial class DirectExecutionBackend
 	private unsafe bool TryForceGuestExitToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid)
 	{
 		ulong num = ActiveEntryReturnSentinelRip;
-		if (num < 65536)
+		if (num < 65536 || !TryPatchActiveGuestReturnSlot(num))
 		{
 			return false;
 		}
@@ -430,7 +434,7 @@ public sealed partial class DirectExecutionBackend
 	private unsafe bool TryCompleteGuestEntryToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid, string reason, int status)
 	{
 		ulong hostExit = ActiveEntryReturnSentinelRip;
-		if (hostExit < 65536)
+		if (hostExit < 65536 || !TryPatchActiveGuestReturnSlot(hostExit))
 		{
 			return false;
 		}
@@ -450,7 +454,7 @@ public sealed partial class DirectExecutionBackend
 	private unsafe bool TryYieldGuestThreadToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid, string reason)
 	{
 		ulong hostExit = ActiveEntryReturnSentinelRip;
-		if (hostExit < 65536)
+		if (hostExit < 65536 || !TryPatchActiveGuestReturnSlot(hostExit))
 		{
 			return false;
 		}
@@ -470,6 +474,14 @@ public sealed partial class DirectExecutionBackend
 		return true;
 	}
 
+	private bool TryPatchActiveGuestReturnSlot(ulong hostExit)
+	{
+		ulong returnSlotAddress = ActiveGuestReturnSlotAddress;
+		return returnSlotAddress != 0 &&
+			ActiveCpuContext is not null &&
+			ActiveCpuContext.TryWriteUInt64(returnSlotAddress, hostExit);
+	}
+
 	private bool ShouldForceGuestExitOnImportLoop(string nid, ulong returnRip, long dispatchIndex, ulong arg0, ulong arg1)
 	{
 		if (dispatchIndex < 1200)
@@ -478,6 +490,11 @@ public sealed partial class DirectExecutionBackend
 		}
 		if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD"), "1", StringComparison.Ordinal))
 		{
+			return false;
+		}
+		if (IsImportLoopGuardBoundary(nid))
+		{
+			ResetImportLoopPattern();
 			return false;
 		}
 		if (!_importNidHashCache.TryGetValue(nid, out var value))
@@ -511,6 +528,17 @@ public sealed partial class DirectExecutionBackend
 
 		var elapsedTicks = Stopwatch.GetTimestamp() - _importLoopPatternStartTimestamp;
 		return elapsedTicks >= (long)(guardSeconds * Stopwatch.Frequency);
+	}
+
+	private static bool IsImportLoopGuardBoundary(string nid) =>
+		string.Equals(nid, "1jfXLRVzisc", StringComparison.Ordinal);
+
+	private void ResetImportLoopPattern()
+	{
+		_importLoopPatternHits = 0;
+		_importLoopPatternStartTimestamp = 0;
+		_importLoopSignatureCount = 0;
+		_importLoopSignatureWriteIndex = 0;
 	}
 
 	private static int GetImportLoopGuardSeconds()
@@ -920,66 +948,6 @@ public sealed partial class DirectExecutionBackend
 		catch
 		{
 			return false;
-		}
-	}
-
-	private void TryBypassStackChkFailTrap(long dispatchIndex, ulong returnRip)
-	{
-		var cpuContext = ActiveCpuContext;
-		if (cpuContext == null || returnRip < 32)
-		{
-			return;
-		}
-		try
-		{
-			byte[] array = new byte[19];
-			ulong num = returnRip - 23;
-			Marshal.Copy((nint)num, array, 0, array.Length);
-			if (array[0] != 117 || array[1] != 16 || array[2] != 72 || array[3] != 137 || array[4] != 216 || array[5] != 72 || array[6] != 131 || array[7] != 196 || array[9] != 91 || array[10] != 65 || array[11] != 92 || array[12] != 65 || array[13] != 94 || array[14] != 65 || array[15] != 95 || array[16] != 93 || array[17] != 195 || array[18] != 232)
-			{
-				return;
-			}
-			ulong value = returnRip - 21;
-			ulong address = cpuContext[CpuRegister.Rsp];
-			if (cpuContext.TryWriteUInt64(address, value))
-			{
-				if (_stackChkBypassSites.Add(num) && TryPatchStackChkFailBranch(num))
-				{
-					Console.Error.WriteLine($"[LOADER][WARNING] Import#{dispatchIndex}: patched stack_chk_fail tail branch at 0x{num:X16} -> NOP NOP");
-				}
-				Console.Error.WriteLine($"[LOADER][WARNING] Import#{dispatchIndex}: redirected __stack_chk_fail return to epilogue 0x{value:X16}");
-			}
-		}
-		catch
-		{
-		}
-	}
-
-	private unsafe static bool TryPatchStackChkFailBranch(ulong branchAddress)
-	{
-		uint flNewProtect = default(uint);
-		if (!VirtualProtect((void*)branchAddress, 2u, 64u, &flNewProtect))
-		{
-			return false;
-		}
-		try
-		{
-			if (Marshal.ReadByte((nint)branchAddress) != 117)
-			{
-				return false;
-			}
-			Marshal.WriteByte((nint)branchAddress, 144);
-			Marshal.WriteByte((nint)(branchAddress + 1), 144);
-			FlushInstructionCache(GetCurrentProcess(), (void*)branchAddress, 2u);
-			return true;
-		}
-		catch
-		{
-			return false;
-		}
-		finally
-		{
-			VirtualProtect((void*)branchAddress, 2u, flNewProtect, &flNewProtect);
 		}
 	}
 

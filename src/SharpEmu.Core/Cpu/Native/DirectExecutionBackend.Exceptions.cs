@@ -19,7 +19,12 @@ public sealed partial class DirectExecutionBackend
 	{
 		if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_RAW_HANDLER"), "1", StringComparison.Ordinal))
 		{
-			_rawExceptionHandler = (nint)AddVectoredExceptionHandler(1u, RawVectoredHandlerPtrManaged);
+			_rawExceptionHandlerStub = CreateExceptionHandlerTrampoline(RawVectoredHandlerPtrManaged);
+			if (_rawExceptionHandlerStub == 0)
+			{
+				throw new InvalidOperationException("Failed to create raw exception handler trampoline");
+			}
+			_rawExceptionHandler = (nint)AddVectoredExceptionHandler(1u, _rawExceptionHandlerStub);
 			Console.Error.WriteLine($"[LOADER][INFO] Raw exception handler installed: 0x{_rawExceptionHandler:X16}");
 		}
 		else
@@ -29,12 +34,22 @@ public sealed partial class DirectExecutionBackend
 
 		_handlerDelegate = VectoredHandler;
 		_handlerHandle = GCHandle.Alloc(_handlerDelegate);
-		_exceptionHandler = (nint)AddVectoredExceptionHandler(1u, Marshal.GetFunctionPointerForDelegate(_handlerDelegate));
+		_exceptionHandlerStub = CreateExceptionHandlerTrampoline(Marshal.GetFunctionPointerForDelegate(_handlerDelegate));
+		if (_exceptionHandlerStub == 0)
+		{
+			throw new InvalidOperationException("Failed to create exception handler trampoline");
+		}
+		_exceptionHandler = (nint)AddVectoredExceptionHandler(1u, _exceptionHandlerStub);
 		Console.Error.WriteLine($"[LOADER][INFO] Exception handler installed: 0x{_exceptionHandler:X16}");
 
 		_unhandledFilterDelegate = UnhandledExceptionFilter;
 		_unhandledFilterHandle = GCHandle.Alloc(_unhandledFilterDelegate);
-		SetUnhandledExceptionFilter(Marshal.GetFunctionPointerForDelegate(_unhandledFilterDelegate));
+		_unhandledFilterStub = CreateExceptionHandlerTrampoline(Marshal.GetFunctionPointerForDelegate(_unhandledFilterDelegate));
+		if (_unhandledFilterStub == 0)
+		{
+			throw new InvalidOperationException("Failed to create unhandled exception filter trampoline");
+		}
+		SetUnhandledExceptionFilter(_unhandledFilterStub);
 	}
 
 	private unsafe int UnhandledExceptionFilter(void* exceptionInfo)

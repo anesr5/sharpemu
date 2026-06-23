@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Text;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Fiber;
 
 namespace SharpEmu.Libs.Kernel;
 
@@ -113,6 +114,7 @@ public static class KernelEventFlagCompatExports
     {
         var handle = ctx[CpuRegister.Rdi];
         var pattern = ctx[CpuRegister.Rsi];
+        var returnRip = GetCurrentReturnRip();
         if (!_eventFlags.TryGetValue(handle, out var state))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
@@ -122,7 +124,7 @@ public static class KernelEventFlagCompatExports
         {
             state.Bits |= pattern;
             Monitor.PulseAll(state.Gate);
-            TraceEventFlag($"set handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16}");
+            TraceEventFlag($"set handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} ret=0x{returnRip:X16}");
         }
 
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
@@ -203,6 +205,7 @@ public static class KernelEventFlagCompatExports
         var waitMode = unchecked((uint)ctx[CpuRegister.Rdx]);
         var resultAddress = ctx[CpuRegister.Rcx];
         var timeoutAddress = ctx[CpuRegister.R8];
+        var returnRip = GetCurrentReturnRip();
 
         if (!_eventFlags.TryGetValue(handle, out var state))
         {
@@ -232,11 +235,17 @@ public static class KernelEventFlagCompatExports
             {
                 _ = TryWriteUInt32(ctx, timeoutAddress, 0);
                 _ = TryWriteResultPattern(ctx, resultAddress, state.Bits);
-                TraceEventFlag($"wait-timeout handle=0x{handle:X16} pattern=0x{pattern:X16} timeout={timeoutUsec}");
+                TraceEventFlag($"wait-timeout handle=0x{handle:X16} pattern=0x{pattern:X16} timeout={timeoutUsec} ret=0x{returnRip:X16}");
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
             }
 
-            if (!GuestThreadExecution.RequestCurrentThreadBlock("sceKernelWaitEventFlag"))
+            var currentGuestThread = GuestThreadExecution.CurrentGuestThreadHandle;
+            var currentFiber = FiberExports.GetCurrentFiberAddressForDiagnostics(ctx);
+            var managedThread = Environment.CurrentManagedThreadId;
+            var requestedBlock = GuestThreadExecution.RequestCurrentThreadBlock("sceKernelWaitEventFlag");
+            TraceEventFlag($"wait-unsatisfied handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} guest_thread=0x{currentGuestThread:X16} fiber=0x{currentFiber:X16} managed={managedThread} block={requestedBlock} ret=0x{returnRip:X16} frames={FormatFrameChain(ctx)}");
+            TraceEventFlag($"wait-object handle=0x{handle:X16} name='{state.Name}' {FormatGuestWaitObject(ctx)}");
+            if (!requestedBlock)
             {
                 var scheduler = GuestThreadExecution.Scheduler;
                 if (scheduler is null)
@@ -245,7 +254,7 @@ public static class KernelEventFlagCompatExports
                 }
 
                 state.WaitingThreads++;
-                TraceEventFlag($"wait-pump handle=0x{handle:X16} pattern=0x{pattern:X16} waiters={state.WaitingThreads}");
+                TraceEventFlag($"wait-pump handle=0x{handle:X16} pattern=0x{pattern:X16} waiters={state.WaitingThreads} guest_thread=0x{currentGuestThread:X16} fiber=0x{currentFiber:X16} managed={managedThread} ret=0x{returnRip:X16}");
                 var releaseWaiter = true;
                 try
                 {
@@ -265,7 +274,7 @@ public static class KernelEventFlagCompatExports
                         {
                             state.WaitingThreads = Math.Max(0, state.WaitingThreads - 1);
                             releaseWaiter = false;
-                            TraceEventFlag($"wait-wake handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} waiters={state.WaitingThreads}");
+                            TraceEventFlag($"wait-wake handle=0x{handle:X16} pattern=0x{pattern:X16} bits=0x{state.Bits:X16} waiters={state.WaitingThreads} ret=0x{returnRip:X16}");
                             return SetReturn(ctx, pumpedWaitResult);
                         }
 
@@ -282,7 +291,7 @@ public static class KernelEventFlagCompatExports
             }
 
             state.WaitingThreads++;
-            TraceEventFlag($"wait-block handle=0x{handle:X16} pattern=0x{pattern:X16} waiters={state.WaitingThreads}");
+            TraceEventFlag($"wait-block handle=0x{handle:X16} pattern=0x{pattern:X16} waiters={state.WaitingThreads} guest_thread=0x{currentGuestThread:X16} fiber=0x{currentFiber:X16} managed={managedThread} ret=0x{returnRip:X16}");
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
         finally
@@ -398,6 +407,32 @@ public static class KernelEventFlagCompatExports
         return true;
     }
 
+    private static bool TryReadUInt64(CpuContext ctx, ulong address, out ulong value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(ulong)];
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            value = 0;
+            return false;
+        }
+
+        value = BinaryPrimitives.ReadUInt64LittleEndian(buffer);
+        return true;
+    }
+
+    private static bool TryReadByte(CpuContext ctx, ulong address, out byte value)
+    {
+        Span<byte> buffer = stackalloc byte[1];
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            value = 0;
+            return false;
+        }
+
+        value = buffer[0];
+        return true;
+    }
+
     private static bool TryWriteUInt32(CpuContext ctx, ulong address, uint value)
     {
         Span<byte> buffer = stackalloc byte[sizeof(uint)];
@@ -442,6 +477,103 @@ public static class KernelEventFlagCompatExports
         if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_EVENT_FLAG"), "1", StringComparison.Ordinal))
         {
             Console.Error.WriteLine($"[LOADER][TRACE] event_flag.{message}");
+        }
+    }
+
+    private static ulong GetCurrentReturnRip() =>
+        GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame)
+            ? frame.ReturnRip
+            : 0UL;
+
+    private static string FormatFrameChain(CpuContext ctx)
+    {
+        Span<ulong> returns = stackalloc ulong[4];
+        var count = 0;
+        var frame = ctx[CpuRegister.Rbp];
+        for (var index = 0; index < returns.Length && frame != 0; index++)
+        {
+            if (!ctx.TryReadUInt64(frame, out var nextFrame) ||
+                !ctx.TryReadUInt64(frame + sizeof(ulong), out var returnAddress))
+            {
+                break;
+            }
+
+            returns[count++] = returnAddress;
+            if (nextFrame <= frame)
+            {
+                break;
+            }
+
+            frame = nextFrame;
+        }
+
+        return count switch
+        {
+            0 => "none",
+            1 => $"0x{returns[0]:X16}",
+            2 => $"0x{returns[0]:X16},0x{returns[1]:X16}",
+            3 => $"0x{returns[0]:X16},0x{returns[1]:X16},0x{returns[2]:X16}",
+            _ => $"0x{returns[0]:X16},0x{returns[1]:X16},0x{returns[2]:X16},0x{returns[3]:X16}",
+        };
+    }
+
+    private static string FormatGuestWaitObject(CpuContext ctx)
+    {
+        var r12 = ctx[CpuRegister.R12];
+        var r13 = ctx[CpuRegister.R13];
+        var objectAddress = r12 != 0
+            ? r12
+            : r13 >= 0xA8
+                ? r13 - 0xA8
+                : 0;
+
+        var builder = new StringBuilder(256);
+        builder.Append($"r12=0x{r12:X16} r13=0x{r13:X16}");
+        if (objectAddress == 0)
+        {
+            return builder.ToString();
+        }
+
+        builder.Append($" obj=0x{objectAddress:X16}");
+        AppendUInt32(builder, ctx, objectAddress + 0x58, "o58");
+        AppendUInt32(builder, ctx, objectAddress + 0x5C, "o5C");
+        AppendUInt64(builder, ctx, objectAddress + 0x60, "o60");
+        AppendByte(builder, ctx, objectAddress + 0x6C, "state6C");
+        AppendByte(builder, ctx, objectAddress + 0x6D, "o6D");
+        AppendByte(builder, ctx, objectAddress + 0xA0, "waitA0");
+        AppendByte(builder, ctx, objectAddress + 0xA1, "stateA1");
+        AppendByte(builder, ctx, objectAddress + 0xA2, "oA2");
+        AppendUInt64(builder, ctx, objectAddress + 0xA8, "eventA8");
+        if (r13 != 0)
+        {
+            AppendUInt64(builder, ctx, r13, "r13_0");
+            AppendUInt64(builder, ctx, r13 + 8, "r13_8");
+        }
+
+        return builder.ToString();
+    }
+
+    private static void AppendByte(StringBuilder builder, CpuContext ctx, ulong address, string name)
+    {
+        if (TryReadByte(ctx, address, out var value))
+        {
+            builder.Append($" {name}=0x{value:X2}");
+        }
+    }
+
+    private static void AppendUInt32(StringBuilder builder, CpuContext ctx, ulong address, string name)
+    {
+        if (TryReadUInt32(ctx, address, out var value))
+        {
+            builder.Append($" {name}=0x{value:X8}");
+        }
+    }
+
+    private static void AppendUInt64(StringBuilder builder, CpuContext ctx, ulong address, string name)
+    {
+        if (TryReadUInt64(ctx, address, out var value))
+        {
+            builder.Append($" {name}=0x{value:X16}");
         }
     }
 }

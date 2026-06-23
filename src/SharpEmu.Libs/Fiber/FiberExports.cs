@@ -230,9 +230,9 @@ public static class FiberExports
         LibraryName = "libSceFiber")]
     public static int FiberReturnToThread(CpuContext ctx)
     {
-        var fiberAddress = _currentFiberAddress;
+        var fiberAddress = ResolveCurrentFiberAddress(ctx);
         var inferredFiber = false;
-        if (fiberAddress == 0 && TryFindFiberByStack(ctx, out fiberAddress))
+        if (_currentFiberAddress == 0 && fiberAddress != 0)
         {
             inferredFiber = true;
         }
@@ -258,9 +258,9 @@ public static class FiberExports
         if (GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
         {
             _continuations[fiberAddress] = new FiberContinuation(
-                CaptureContinuation(ctx, frame.ReturnRip, frame.ResumeRsp),
+                CaptureContinuation(ctx, frame.ReturnRip, frame.ResumeRsp, frame.ReturnSlotAddress),
                 argOnRunAddress);
-            TraceFiber($"yield{(inferredFiber ? "-inferred" : string.Empty)} fiber=0x{fiberAddress:X16} resume=0x{frame.ReturnRip:X16} rsp=0x{frame.ResumeRsp:X16} arg_out=0x{argOnRunAddress:X16}");
+            TraceFiber($"yield{(inferredFiber ? "-inferred" : string.Empty)} fiber=0x{fiberAddress:X16} resume=0x{frame.ReturnRip:X16} rsp=0x{frame.ResumeRsp:X16} return_slot=0x{frame.ReturnSlotAddress:X16} arg_out=0x{argOnRunAddress:X16}");
         }
         else
         {
@@ -284,12 +284,13 @@ public static class FiberExports
             return SetReturn(ctx, FiberErrorNull);
         }
 
-        if (_currentFiberAddress == 0)
+        var fiberAddress = ResolveCurrentFiberAddress(ctx);
+        if (fiberAddress == 0)
         {
             return SetReturn(ctx, FiberErrorPermission);
         }
 
-        return TryWriteUInt64(ctx, outAddress, _currentFiberAddress)
+        return TryWriteUInt64(ctx, outAddress, fiberAddress)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, FiberErrorInvalid);
     }
@@ -407,7 +408,7 @@ public static class FiberExports
             return SetReturn(ctx, FiberErrorNull);
         }
 
-        if (_currentFiberAddress == 0)
+        if (ResolveCurrentFiberAddress(ctx) == 0)
         {
             return SetReturn(ctx, FiberErrorPermission);
         }
@@ -537,10 +538,11 @@ public static class FiberExports
 
         if (fields.State != FiberStateIdle)
         {
+            TraceFiber($"run-state-error reason={reason} fiber=0x{fiber:X16} state=0x{fields.State:X8}");
             return SetReturn(ctx, FiberErrorState);
         }
 
-        var previousFiber = _currentFiberAddress;
+        var previousFiber = ResolveCurrentFiberAddress(ctx);
         var switchingFromFiber = isSwitch && previousFiber != 0 && previousFiber != fiber;
         if (isSwitch && previousFiber == 0)
         {
@@ -553,56 +555,111 @@ public static class FiberExports
             return SetReturn(ctx, FiberErrorPermission);
         }
 
+        var session = new FiberRunSession();
+        var ownsSession = _runSessions.TryAdd(fiber, session);
+        if (!ownsSession && !_runSessions.TryGetValue(fiber, out session))
+        {
+            return SetReturn(ctx, FiberErrorState);
+        }
+
+        FiberContinuation? previousContinuation = null;
+        GuestImportCallFrame switchFrame = default;
+        if (switchingFromFiber)
+        {
+            if (!GuestThreadExecution.TryGetCurrentImportCallFrame(out switchFrame))
+            {
+                if (ownsSession)
+                {
+                    _runSessions.TryRemove(fiber, out _);
+                }
+                TraceFiber($"switch-no-frame from=0x{previousFiber:X16} to=0x{fiber:X16} arg_out=0x{outArgumentAddress:X16}");
+                return SetReturn(ctx, FiberErrorPermission);
+            }
+
+            previousContinuation = new FiberContinuation(
+                CaptureContinuation(ctx, switchFrame.ReturnRip, switchFrame.ResumeRsp, switchFrame.ReturnSlotAddress),
+                outArgumentAddress);
+        }
+
         if (!TryWriteUInt32(ctx, fiber + FiberStateOffset, FiberStateRun))
         {
+            if (ownsSession)
+            {
+                _runSessions.TryRemove(fiber, out _);
+            }
             return SetReturn(ctx, FiberErrorInvalid);
         }
 
         if (switchingFromFiber && !TryWriteUInt32(ctx, previousFiber + FiberStateOffset, FiberStateIdle))
         {
             _ = TryWriteUInt32(ctx, fiber + FiberStateOffset, FiberStateIdle);
+            if (ownsSession)
+            {
+                _runSessions.TryRemove(fiber, out _);
+            }
             return SetReturn(ctx, FiberErrorInvalid);
+        }
+
+        if (previousContinuation.HasValue)
+        {
+            _continuations[previousFiber] = previousContinuation.Value;
+            TraceFiber($"switch-save from=0x{previousFiber:X16} to=0x{fiber:X16} resume=0x{switchFrame.ReturnRip:X16} rsp=0x{switchFrame.ResumeRsp:X16} return_slot=0x{switchFrame.ReturnSlotAddress:X16} arg_out=0x{outArgumentAddress:X16}");
         }
 
         var previousReturnRequested = _fiberReturnRequested;
         var previousReturnArgument = _fiberReturnArgument;
-        var session = new FiberRunSession();
-        _runSessions[fiber] = session;
         _currentFiberAddress = fiber;
         _fiberReturnRequested = false;
         _fiberReturnArgument = 0;
+        var previousExecutionFiber = GuestThreadExecution.EnterFiber(fiber);
+        TraceFiber($"run-enter reason={reason} fiber=0x{fiber:X16} prev=0x{previousFiber:X16} thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} managed={Environment.CurrentManagedThreadId} stack=0x{fields.ContextAddress:X16}");
 
         var hasContinuation = _continuations.TryGetValue(fiber, out var continuation);
-        bool callbackOk;
-        string? callbackError;
         if (hasContinuation)
         {
-            if (continuation.ArgOnRunAddress != 0 &&
-                !TryWriteUInt64(ctx, continuation.ArgOnRunAddress, argOnRun))
+            _continuations.TryRemove(fiber, out _);
+        }
+
+        TraceFiber(hasContinuation
+            ? $"run-dispatch reason={reason} fiber=0x{fiber:X16} resume=1 rip=0x{continuation.Context.Rip:X16} rsp=0x{continuation.Context.Rsp:X16} return_slot=0x{continuation.Context.ReturnSlotAddress:X16} arg_out=0x{continuation.ArgOnRunAddress:X16}"
+            : $"run-dispatch reason={reason} fiber=0x{fiber:X16} resume=0 rip=0x{fields.Entry:X16} rsp=0x{fields.ContextAddress + fields.ContextSize:X16} arg_out=0x{outArgumentAddress:X16}");
+        bool callbackOk;
+        string? callbackError;
+        try
+        {
+            if (hasContinuation)
             {
-                callbackOk = false;
-                callbackError = $"failed to write resumed argOnRun to 0x{continuation.ArgOnRunAddress:X16}";
+                if (continuation.ArgOnRunAddress != 0 &&
+                    !TryWriteUInt64(ctx, continuation.ArgOnRunAddress, argOnRun))
+                {
+                    callbackOk = false;
+                    callbackError = $"failed to write resumed argOnRun to 0x{continuation.ArgOnRunAddress:X16}";
+                }
+                else
+                {
+                    callbackOk = scheduler.TryCallGuestContinuation(
+                        ctx,
+                        continuation.Context,
+                        reason,
+                        out callbackError);
+                }
             }
             else
             {
-                callbackOk = scheduler.TryCallGuestContinuation(
+                callbackOk = scheduler.TryCallGuestFunction(
                     ctx,
-                    continuation.Context,
+                    fields.Entry,
+                    fields.ArgOnInitialize,
+                    argOnRun,
+                    fields.ContextAddress,
+                    fields.ContextSize,
                     reason,
                     out callbackError);
             }
         }
-        else
+        finally
         {
-            callbackOk = scheduler.TryCallGuestFunction(
-                ctx,
-                fields.Entry,
-                fields.ArgOnInitialize,
-                argOnRun,
-                fields.ContextAddress,
-                fields.ContextSize,
-                reason,
-                out callbackError);
+            GuestThreadExecution.RestoreFiber(previousExecutionFiber);
         }
 
         var returnRequested = _fiberReturnRequested;
@@ -613,11 +670,10 @@ public static class FiberExports
             returnArgument = sessionReturnArgument;
         }
 
-        if (!returnRequested)
+        if (ownsSession)
         {
-            _continuations.TryRemove(fiber, out _);
+            _runSessions.TryRemove(fiber, out _);
         }
-        _runSessions.TryRemove(fiber, out _);
 
         _currentFiberAddress = previousFiber;
         _fiberReturnRequested = previousReturnRequested;
@@ -644,10 +700,15 @@ public static class FiberExports
         return SetReturn(ctx, 0);
     }
 
-    private static GuestCpuContinuation CaptureContinuation(CpuContext ctx, ulong resumeRip, ulong resumeRsp) =>
+    private static GuestCpuContinuation CaptureContinuation(
+        CpuContext ctx,
+        ulong resumeRip,
+        ulong resumeRsp,
+        ulong returnSlotAddress) =>
         new(
             resumeRip,
             resumeRsp,
+            returnSlotAddress,
             ctx.Rflags == 0 ? 0x202UL : ctx.Rflags,
             ctx.FsBase,
             ctx.GsBase,
@@ -664,6 +725,24 @@ public static class FiberExports
             ctx[CpuRegister.R13],
             ctx[CpuRegister.R14],
             ctx[CpuRegister.R15]);
+
+    private static ulong ResolveCurrentFiberAddress(CpuContext ctx)
+    {
+        if (_currentFiberAddress != 0)
+        {
+            return _currentFiberAddress;
+        }
+
+        if (GuestThreadExecution.CurrentFiberAddress != 0)
+        {
+            return GuestThreadExecution.CurrentFiberAddress;
+        }
+
+        return TryFindFiberByStack(ctx, out var fiberAddress) ? fiberAddress : 0;
+    }
+
+    internal static ulong GetCurrentFiberAddressForDiagnostics(CpuContext ctx) =>
+        ResolveCurrentFiberAddress(ctx);
 
     private static int AttachContext(
         CpuContext ctx,

@@ -136,9 +136,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private nint _unresolvedReturnStub;
 
+	private nint _guestReturnStub;
+
 	private nint _rawExceptionHandler;
 
+	private nint _rawExceptionHandlerStub;
+
 	private nint _exceptionHandler;
+
+	private nint _exceptionHandlerStub;
+
+	private nint _unhandledFilterStub;
 
 	private nint _lowIndexedTableScratch;
 
@@ -160,6 +168,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	[ThreadStatic]
 	private static ulong _activeEntryReturnSentinelRip;
+
+	[ThreadStatic]
+	private static ulong _activeGuestReturnSlotAddress;
 
 	[ThreadStatic]
 	private static bool _activeForcedGuestExit;
@@ -201,8 +212,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private bool _logStrlenImports;
 
 	private readonly HashSet<ulong> _fallbackTrapStubs = new HashSet<ulong>();
-
-	private readonly HashSet<ulong> _stackChkBypassSites = new HashSet<ulong>();
 
 	private readonly HashSet<ulong> _patchedResolverReturnSites = new HashSet<ulong>();
 
@@ -539,6 +548,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	private ulong ActiveGuestReturnSlotAddress =>
+		HasActiveExecutionThread ? _activeGuestReturnSlotAddress : 0;
+
 	private bool ActiveForcedGuestExit
 	{
 		get => HasActiveExecutionThread ? _activeForcedGuestExit : _forcedGuestExit;
@@ -591,6 +603,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		DirectExecutionBackend? previousBackend,
 		CpuContext? previousContext,
 		ulong previousSentinel,
+		ulong previousReturnSlotAddress,
 		bool previousForcedExit,
 		bool previousYieldRequested,
 		string? previousYieldReason)
@@ -598,6 +611,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_activeExecutionBackend = previousBackend;
 		_activeCpuContext = previousContext;
 		_activeEntryReturnSentinelRip = previousSentinel;
+		_activeGuestReturnSlotAddress = previousReturnSlotAddress;
 		_activeForcedGuestExit = previousForcedExit;
 		_activeGuestThreadYieldRequested = previousYieldRequested;
 		_activeGuestThreadYieldReason = previousYieldReason;
@@ -634,6 +648,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			throw new OutOfMemoryException("Failed to allocate host stack slot storage");
 		}
 		_unresolvedReturnStub = CreateUnresolvedReturnStub();
+		_guestReturnStub = CreateGuestReturnStub();
+		if (_guestReturnStub == 0)
+		{
+			throw new OutOfMemoryException("Failed to allocate guest return stub");
+		}
 		SetupExceptionHandler();
 	}
 
@@ -930,9 +949,24 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		yield return "_" + exportName;
 	}
 
-	private static bool IsDirectImportTargetUsable(ulong address)
+	private bool IsDirectImportTargetUsable(ulong address)
 	{
-		return address >= 65536 && !IsUnresolvedSentinel(address);
+		if (address < 65536 || IsUnresolvedSentinel(address) ||
+			_cpuContext is null || !TryGetVirtualMemory(_cpuContext, out var virtualMemory))
+		{
+			return false;
+		}
+
+		foreach (var region in virtualMemory.SnapshotRegions())
+		{
+			if ((region.Protection & ProgramHeaderFlags.Execute) != 0 &&
+				ContainsAddress(region.VirtualAddress, region.MemorySize, address))
+			{
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	private unsafe void BindTlsBase(CpuContext context)
@@ -1240,6 +1274,145 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		uint num = default(uint);
 		VirtualProtect(ptr, 4096u, 32u, &num);
 		FlushInstructionCache(GetCurrentProcess(), ptr, 16u);
+		return (nint)ptr;
+	}
+
+	private unsafe nint CreateGuestReturnStub()
+	{
+		const uint stubSize = 256u;
+		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
+		if (ptr == null)
+		{
+			return 0;
+		}
+
+		byte* code = (byte*)ptr;
+		int offset = 0;
+		EmitByte(code, ref offset, 0x48); // sub rsp, 0x20
+		EmitByte(code, ref offset, 0x83);
+		EmitByte(code, ref offset, 0xEC);
+		EmitByte(code, ref offset, 0x20);
+		EmitByte(code, ref offset, 0xB9); // mov ecx, tlsIndex
+		EmitUInt32(code, ref offset, _hostRspSlotTlsIndex);
+		EmitByte(code, ref offset, 0x48); // mov rax, TlsGetValue
+		EmitByte(code, ref offset, 0xB8);
+		*(long*)(code + offset) = _tlsGetValueAddress;
+		offset += sizeof(ulong);
+		EmitByte(code, ref offset, 0xFF); // call rax
+		EmitByte(code, ref offset, 0xD0);
+		EmitByte(code, ref offset, 0x48); // add rsp, 0x20
+		EmitByte(code, ref offset, 0x83);
+		EmitByte(code, ref offset, 0xC4);
+		EmitByte(code, ref offset, 0x20);
+		EmitByte(code, ref offset, 0x48); // mov rsp, [rax]
+		EmitByte(code, ref offset, 0x8B);
+		EmitByte(code, ref offset, 0x20);
+		EmitHostNonvolatileXmmRestore(code, ref offset);
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5F);
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5E);
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5D);
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5C);
+		EmitByte(code, ref offset, 0x5E);
+		EmitByte(code, ref offset, 0x5F);
+		EmitByte(code, ref offset, 0x5D);
+		EmitByte(code, ref offset, 0x5B);
+		EmitByte(code, ref offset, 0xC3);
+
+		uint oldProtect = default;
+		VirtualProtect(ptr, stubSize, 32u, &oldProtect);
+		FlushInstructionCache(GetCurrentProcess(), ptr, (nuint)offset);
+		return (nint)ptr;
+	}
+
+	private unsafe nint CreateExceptionHandlerTrampoline(nint managedHandler)
+	{
+		const uint stubSize = 256u;
+		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
+		if (ptr == null)
+		{
+			return 0;
+		}
+
+		byte* code = (byte*)ptr;
+		int offset = 0;
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x54); // push r12
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x55); // push r13
+		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE4); // mov r12, rsp
+		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xCD); // mov r13, rcx
+		EmitByte(code, ref offset, 0x65); EmitByte(code, ref offset, 0x48); // mov rax, gs:[8]
+		EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x04); EmitByte(code, ref offset, 0x25);
+		EmitUInt32(code, ref offset, 8u);
+		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x39); EmitByte(code, ref offset, 0xC4); // cmp r12, rax
+		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x83); // jae guestStack
+		int aboveStackJump = offset;
+		EmitUInt32(code, ref offset, 0u);
+		EmitByte(code, ref offset, 0x65); EmitByte(code, ref offset, 0x48); // mov rax, gs:[0x10]
+		EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x04); EmitByte(code, ref offset, 0x25);
+		EmitUInt32(code, ref offset, 0x10u);
+		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x39); EmitByte(code, ref offset, 0xC4); // cmp r12, rax
+		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x82); // jb guestStack
+		int belowStackJump = offset;
+		EmitUInt32(code, ref offset, 0u);
+
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xEC); EmitByte(code, ref offset, 0x28);
+		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE9); // mov rcx, r13
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0xB8);
+		*(nint*)(code + offset) = managedHandler;
+		offset += sizeof(nint);
+		EmitByte(code, ref offset, 0xFF); EmitByte(code, ref offset, 0xD0);
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xC4); EmitByte(code, ref offset, 0x28);
+		EmitByte(code, ref offset, 0xE9);
+		int hostRestoreJump = offset;
+		EmitUInt32(code, ref offset, 0u);
+
+		int guestStackOffset = offset;
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xEC); EmitByte(code, ref offset, 0x28);
+		EmitByte(code, ref offset, 0xB9);
+		EmitUInt32(code, ref offset, _hostRspSlotTlsIndex);
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0xB8);
+		*(nint*)(code + offset) = _tlsGetValueAddress;
+		offset += sizeof(nint);
+		EmitByte(code, ref offset, 0xFF); EmitByte(code, ref offset, 0xD0);
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xC4); EmitByte(code, ref offset, 0x28);
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x85); EmitByte(code, ref offset, 0xC0); // test rax, rax
+		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x84);
+		int missingTlsJump = offset;
+		EmitUInt32(code, ref offset, 0u);
+		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x18); // mov r11, [rax]
+		EmitByte(code, ref offset, 0x4D); EmitByte(code, ref offset, 0x85); EmitByte(code, ref offset, 0xDB); // test r11, r11
+		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x84);
+		int missingHostStackJump = offset;
+		EmitUInt32(code, ref offset, 0u);
+		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xDC); // mov rsp, r11
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xEC); EmitByte(code, ref offset, 0x28);
+		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE9); // mov rcx, r13
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0xB8);
+		*(nint*)(code + offset) = managedHandler;
+		offset += sizeof(nint);
+		EmitByte(code, ref offset, 0xFF); EmitByte(code, ref offset, 0xD0);
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x83); EmitByte(code, ref offset, 0xC4); EmitByte(code, ref offset, 0x28);
+		EmitByte(code, ref offset, 0xE9);
+		int guestRestoreJump = offset;
+		EmitUInt32(code, ref offset, 0u);
+
+		int passThroughOffset = offset;
+		EmitByte(code, ref offset, 0x31); EmitByte(code, ref offset, 0xC0); // xor eax, eax
+		int restoreOffset = offset;
+		EmitByte(code, ref offset, 0x4C); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE4); // mov rsp, r12
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5D);
+		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5C);
+		EmitByte(code, ref offset, 0xC3);
+
+		*(int*)(code + aboveStackJump) = guestStackOffset - (aboveStackJump + sizeof(int));
+		*(int*)(code + belowStackJump) = guestStackOffset - (belowStackJump + sizeof(int));
+		*(int*)(code + hostRestoreJump) = restoreOffset - (hostRestoreJump + sizeof(int));
+		*(int*)(code + missingTlsJump) = passThroughOffset - (missingTlsJump + sizeof(int));
+		*(int*)(code + missingHostStackJump) = passThroughOffset - (missingHostStackJump + sizeof(int));
+		*(int*)(code + guestRestoreJump) = restoreOffset - (guestRestoreJump + sizeof(int));
+
+		uint oldProtect = default;
+		VirtualProtect(ptr, stubSize, 32u, &oldProtect);
+		FlushInstructionCache(GetCurrentProcess(), ptr, (nuint)offset);
 		return (nint)ptr;
 	}
 
@@ -1980,8 +2153,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			Rip = continuation.Rip,
 			Rflags = continuation.Rflags == 0 ? 0x202UL : continuation.Rflags,
-			FsBase = continuation.FsBase != 0 ? continuation.FsBase : (callerContext.FsBase != 0 ? callerContext.FsBase : fallbackTlsBase),
-			GsBase = continuation.GsBase != 0 ? continuation.GsBase : (callerContext.GsBase != 0 ? callerContext.GsBase : fallbackTlsBase),
+			FsBase = callerContext.FsBase != 0 ? callerContext.FsBase : (continuation.FsBase != 0 ? continuation.FsBase : fallbackTlsBase),
+			GsBase = callerContext.GsBase != 0 ? callerContext.GsBase : (continuation.GsBase != 0 ? continuation.GsBase : fallbackTlsBase),
 		};
 
 		context[CpuRegister.Rax] = continuation.Rax;
@@ -1997,21 +2170,39 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		context[CpuRegister.R13] = continuation.R13;
 		context[CpuRegister.R14] = continuation.R14;
 		context[CpuRegister.R15] = continuation.R15;
-		context[CpuRegister.Rsp] = continuation.Rsp + 16uL;
+		context[CpuRegister.Rsp] = continuation.Rsp;
 
-		var currentGuestThreadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
 		var exitReason = GuestNativeCallExitReason.Exception;
 		string? callbackReason = null;
 		string? callbackLastError = null;
 		Exception? callbackException = null;
+		var currentGuestThreadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
+		var currentFiberAddress = GuestThreadExecution.CurrentFiberAddress;
 
 		void RunContinuation()
 		{
+			var restoreGuestThread = currentGuestThreadHandle != 0 &&
+				GuestThreadExecution.CurrentGuestThreadHandle != currentGuestThreadHandle;
+			var previousGuestThreadHandle = restoreGuestThread
+				? GuestThreadExecution.EnterGuestThread(currentGuestThreadHandle)
+				: 0UL;
+			var restoreFiber = currentFiberAddress != 0 &&
+				GuestThreadExecution.CurrentFiberAddress != currentFiberAddress;
+			var previousFiberAddress = restoreFiber
+				? GuestThreadExecution.EnterFiber(currentFiberAddress)
+				: 0UL;
 			var previousLastError = LastError;
 			try
 			{
+				TraceGuestContext(
+					$"continuation-enter reason={reason} managed={Environment.CurrentManagedThreadId} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} fiber=0x{GuestThreadExecution.CurrentFiberAddress:X16} captured_guest=0x{currentGuestThreadHandle:X16} captured_fiber=0x{currentFiberAddress:X16} restore_guest={restoreGuestThread} restore_fiber={restoreFiber}");
 				LastError = null;
-				exitReason = ExecuteGuestContinuationEntry(context, continuation.Rip, reason, out callbackReason);
+				exitReason = ExecuteGuestContinuationEntry(
+					context,
+					continuation.Rip,
+					continuation.ReturnSlotAddress,
+					reason,
+					out callbackReason);
 				callbackLastError = LastError;
 			}
 			catch (Exception ex)
@@ -2022,7 +2213,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			finally
 			{
+				TraceGuestContext(
+					$"continuation-exit reason={reason} managed={Environment.CurrentManagedThreadId} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} fiber=0x{GuestThreadExecution.CurrentFiberAddress:X16} exit={exitReason}");
 				LastError = previousLastError;
+				if (restoreFiber)
+				{
+					GuestThreadExecution.RestoreFiber(previousFiberAddress);
+				}
+				if (restoreGuestThread)
+				{
+					GuestThreadExecution.RestoreGuestThread(previousGuestThreadHandle);
+				}
 			}
 		}
 
@@ -2044,6 +2245,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			if (runner is not null && !runner.IsCurrentThread)
 			{
 				runner.Run(RunContinuation);
+			}
+			else if (runner is not null)
+			{
+				TraceGuestContext(
+					$"continuation-inline reason={reason} managed={Environment.CurrentManagedThreadId} guest=0x{currentGuestThreadHandle:X16} fiber=0x{currentFiberAddress:X16}");
+				RunContinuation();
 			}
 			else
 			{
@@ -2068,6 +2275,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 
 		return true;
+	}
+
+	private static void TraceGuestContext(string message)
+	{
+		if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_CONTEXT"), "1", StringComparison.Ordinal))
+		{
+			Console.Error.WriteLine($"[LOADER][TRACE] guest_context.{message}");
+		}
 	}
 
 	private static void RunContinuationOnTemporaryThread(ulong guestThreadHandle, Action continuation)
@@ -2351,6 +2566,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var previousActiveBackend = _activeExecutionBackend;
 		var previousActiveContext = _activeCpuContext;
 		var previousSentinel = _activeEntryReturnSentinelRip;
+		var previousReturnSlotAddress = _activeGuestReturnSlotAddress;
 		var previousForcedExit = _activeForcedGuestExit;
 		var previousYieldRequested = _activeGuestThreadYieldRequested;
 		var previousYieldReason = _activeGuestThreadYieldReason;
@@ -2360,6 +2576,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_activeExecutionBackend = this;
 			_activeCpuContext = context;
 			_activeEntryReturnSentinelRip = 0;
+			_activeGuestReturnSlotAddress = 0;
 			_activeForcedGuestExit = false;
 			_activeGuestThreadYieldRequested = false;
 			_activeGuestThreadYieldReason = null;
@@ -2463,7 +2680,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[offset++] = 91;
 			ptr2[offset++] = 195;
 			ulong sentinel = (ulong)ptr + (ulong)sentinelOffset;
-			ActiveEntryReturnSentinelRip = sentinel;
+			ActiveEntryReturnSentinelRip = (ulong)_guestReturnStub;
+			_activeGuestReturnSlotAddress = context[CpuRegister.Rsp] - 16uL;
 			if (!context.TryWriteUInt64(context[CpuRegister.Rsp], sentinel))
 			{
 				reason = $"failed to patch guest thread return sentinel at 0x{context[CpuRegister.Rsp]:X16}";
@@ -2509,6 +2727,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousActiveBackend,
 				previousActiveContext,
 				previousSentinel,
+				previousReturnSlotAddress,
 				previousForcedExit,
 				previousYieldRequested,
 				previousYieldReason);
@@ -2516,7 +2735,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
-	private unsafe GuestNativeCallExitReason ExecuteGuestContinuationEntry(CpuContext context, ulong entryPoint, string name, out string? reason)
+	private unsafe GuestNativeCallExitReason ExecuteGuestContinuationEntry(
+		CpuContext context,
+		ulong entryPoint,
+		ulong returnSlotAddress,
+		string name,
+		out string? reason)
 	{
 		reason = null;
 		if (context[CpuRegister.Rsp] == 0)
@@ -2534,6 +2758,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var previousActiveBackend = _activeExecutionBackend;
 		var previousActiveContext = _activeCpuContext;
 		var previousSentinel = _activeEntryReturnSentinelRip;
+		var previousReturnSlotAddress = _activeGuestReturnSlotAddress;
 		var previousForcedExit = _activeForcedGuestExit;
 		var previousYieldRequested = _activeGuestThreadYieldRequested;
 		var previousYieldReason = _activeGuestThreadYieldReason;
@@ -2543,6 +2768,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_activeExecutionBackend = this;
 			_activeCpuContext = context;
 			_activeEntryReturnSentinelRip = 0;
+			_activeGuestReturnSlotAddress = returnSlotAddress;
 			_activeForcedGuestExit = false;
 			_activeGuestThreadYieldRequested = false;
 			_activeGuestThreadYieldReason = null;
@@ -2577,7 +2803,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Emit(0x49); Emit(0x89); Emit(0x22); // mov [r10], rsp
 			EmitMovR64Imm(0x48, 0xB8, context[CpuRegister.Rsp]); // mov rax, guest rsp
 			Emit(0x48); Emit(0x89); Emit(0xC4); // mov rsp, rax
-			Emit(0x48); Emit(0x83); Emit(0xEC); Emit(0x08); // sub rsp, 8
 			EmitMovR64Imm(0x48, 0xBB, context[CpuRegister.Rbx]); // mov rbx, imm64
 			EmitMovR64Imm(0x48, 0xBD, context[CpuRegister.Rbp]); // mov rbp, imm64
 			EmitMovR64Imm(0x48, 0xBF, context[CpuRegister.Rdi]); // mov rdi, imm64
@@ -2592,29 +2817,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			EmitMovR64Imm(0x49, 0xBF, context[CpuRegister.R15]); // mov r15, imm64
 			EmitMovR64Imm(0x48, 0xB8, context[CpuRegister.Rax]); // mov rax, imm64
 			EmitMovR64Imm(0x49, 0xBB, entryPoint); // mov r11, entryPoint
-			Emit(0x41); Emit(0xFF); Emit(0xD3); // call r11
-			int sentinelOffset = offset + 4;
-			Emit(0x48); Emit(0x83); Emit(0xC4); Emit(0x08); // add rsp, 8
-			EmitMovR64Imm(0x49, 0xBA, hostRspSlot); // mov r10, hostRspSlot
-			Emit(0x49); Emit(0x8B); Emit(0x22); // mov rsp, [r10]
-			EmitHostNonvolatileXmmRestore(ptr2, ref offset);
-			Emit(0x41); Emit(0x5F); // pop r15
-			Emit(0x41); Emit(0x5E); // pop r14
-			Emit(0x41); Emit(0x5D); // pop r13
-			Emit(0x41); Emit(0x5C); // pop r12
-			Emit(0x5E); // pop rsi
-			Emit(0x5F); // pop rdi
-			Emit(0x5D); // pop rbp
-			Emit(0x5B); // pop rbx
-			Emit(0xC3); // ret
-			ulong sentinel = (ulong)ptr + (ulong)sentinelOffset;
-			ActiveEntryReturnSentinelRip = sentinel;
-			var sentinelStackAddress = context[CpuRegister.Rsp] >= 16uL
-				? context[CpuRegister.Rsp] - 16uL
-				: 0;
-			if (sentinelStackAddress == 0 || !context.TryWriteUInt64(sentinelStackAddress, sentinel))
+			Emit(0x41); Emit(0xFF); Emit(0xE3); // jmp r11
+			ActiveEntryReturnSentinelRip = (ulong)_guestReturnStub;
+			if (returnSlotAddress == 0 || !context.TryWriteUInt64(returnSlotAddress, (ulong)_guestReturnStub))
 			{
-				reason = $"failed to patch guest continuation return sentinel at 0x{sentinelStackAddress:X16}";
+				reason = $"failed to patch guest continuation return slot at 0x{returnSlotAddress:X16}";
 				return GuestNativeCallExitReason.Exception;
 			}
 			uint oldProtect = default(uint);
@@ -2657,6 +2864,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousActiveBackend,
 				previousActiveContext,
 				previousSentinel,
+				previousReturnSlotAddress,
 				previousForcedExit,
 				previousYieldRequested,
 				previousYieldReason);
@@ -2717,9 +2925,18 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		EmitByte(code, ref offset, 0x0F);
 		EmitByte(code, ref offset, store ? (byte)0x7F : (byte)0x6F);
-		EmitByte(code, ref offset, (byte)(0x44 | ((xmm & 7) << 3)));
-		EmitByte(code, ref offset, 0x24);
-		EmitByte(code, ref offset, displacement);
+		if (displacement < 0x80)
+		{
+			EmitByte(code, ref offset, (byte)(0x44 | ((xmm & 7) << 3)));
+			EmitByte(code, ref offset, 0x24);
+			EmitByte(code, ref offset, displacement);
+		}
+		else
+		{
+			EmitByte(code, ref offset, (byte)(0x84 | ((xmm & 7) << 3)));
+			EmitByte(code, ref offset, 0x24);
+			EmitUInt32(code, ref offset, displacement);
+		}
 	}
 
 	private unsafe bool ExecuteEntry(CpuContext context, ulong entryPoint, out OrbisGen2Result result)
@@ -2745,6 +2962,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var previousActiveBackend = _activeExecutionBackend;
 		var previousActiveContext = _activeCpuContext;
 		var previousSentinel = _activeEntryReturnSentinelRip;
+		var previousReturnSlotAddress = _activeGuestReturnSlotAddress;
 		var previousForcedExit = _activeForcedGuestExit;
 		var previousYieldRequested = _activeGuestThreadYieldRequested;
 		var previousYieldReason = _activeGuestThreadYieldReason;
@@ -2754,6 +2972,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_activeExecutionBackend = this;
 			_activeCpuContext = context;
 			_activeEntryReturnSentinelRip = 0;
+			_activeGuestReturnSlotAddress = 0;
 			_activeForcedGuestExit = false;
 			_activeGuestThreadYieldRequested = false;
 			_activeGuestThreadYieldReason = null;
@@ -2857,7 +3076,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num3++] = 91;
 			ptr2[num3++] = 195;
 			ulong value = (ulong)ptr + (ulong)num4;
-			ActiveEntryReturnSentinelRip = value;
+			ActiveEntryReturnSentinelRip = (ulong)_guestReturnStub;
+			_activeGuestReturnSlotAddress = context[CpuRegister.Rsp] - 16uL;
 			if (!context.TryWriteUInt64(context[CpuRegister.Rsp], value))
 			{
 				LastError = $"Failed to patch native return sentinel at 0x{context[CpuRegister.Rsp]:X16}";
@@ -2939,6 +3159,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				previousActiveBackend,
 				previousActiveContext,
 				previousSentinel,
+				previousReturnSlotAddress,
 				previousForcedExit,
 				previousYieldRequested,
 				previousYieldReason);
@@ -3116,6 +3337,22 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			RemoveVectoredExceptionHandler((void*)_rawExceptionHandler);
 			_rawExceptionHandler = 0;
 		}
+		if (_rawExceptionHandlerStub != 0)
+		{
+			VirtualFree((void*)_rawExceptionHandlerStub, 0u, 32768u);
+			_rawExceptionHandlerStub = 0;
+		}
+		if (_exceptionHandlerStub != 0)
+		{
+			VirtualFree((void*)_exceptionHandlerStub, 0u, 32768u);
+			_exceptionHandlerStub = 0;
+		}
+		if (_unhandledFilterStub != 0)
+		{
+			SetUnhandledExceptionFilter(0);
+			VirtualFree((void*)_unhandledFilterStub, 0u, 32768u);
+			_unhandledFilterStub = 0;
+		}
 		if (_handlerHandle.IsAllocated)
 		{
 			_handlerHandle.Free();
@@ -3171,6 +3408,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			VirtualFree((void*)_unresolvedReturnStub, 0u, 32768u);
 			_unresolvedReturnStub = 0;
+		}
+		if (_guestReturnStub != 0)
+		{
+			VirtualFree((void*)_guestReturnStub, 0u, 32768u);
+			_guestReturnStub = 0;
 		}
 		if (_lowIndexedTableScratch != 0)
 		{

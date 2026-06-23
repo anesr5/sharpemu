@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.Ampr;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Threading;
@@ -37,6 +38,12 @@ public static class KernelAprCompatExports
         }
 
         _submittedCommandBuffers[submissionId] = commandBuffer;
+
+        var completionResult = AmprExports.CompleteCommandBuffer(ctx, commandBuffer);
+        if (completionResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            return completionResult;
+        }
 
         if (outSubmissionId != 0 && !TryWriteUInt32(ctx, outSubmissionId, submissionId))
         {
@@ -93,6 +100,12 @@ public static class KernelAprCompatExports
         var submissionId = unchecked((uint)Interlocked.Increment(ref _nextSubmissionId));
         _submittedCommandBuffers[submissionId] = commandBuffer;
 
+        var completionResult = AmprExports.CompleteCommandBuffer(ctx, commandBuffer);
+        if (completionResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            return completionResult;
+        }
+
         TraceApr(ctx, "submit", submissionId, commandBuffer, ctx[CpuRegister.Rsi], 0);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -113,6 +126,12 @@ public static class KernelAprCompatExports
 
         var submissionId = unchecked((uint)Interlocked.Increment(ref _nextSubmissionId));
         _submittedCommandBuffers[submissionId] = commandBuffer;
+
+        var completionResult = AmprExports.CompleteCommandBuffer(ctx, commandBuffer);
+        if (completionResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            return completionResult;
+        }
 
         if (!TryWriteUInt32(ctx, outSubmissionId, submissionId))
         {
@@ -154,5 +173,12 @@ public static class KernelAprCompatExports
         _ = ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out returnRip);
         Console.Error.WriteLine(
             $"[LOADER][TRACE] apr.{operation}: id=0x{submissionId:X8} cmd=0x{commandBuffer:X16} priority=0x{priority:X16} aux=0x{aux:X16} ret=0x{returnRip:X16}");
+        if (aux != 0 &&
+            ctx.TryReadUInt64(aux, out var result0) &&
+            ctx.TryReadUInt64(aux + sizeof(ulong), out var result1))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] apr.{operation}.result: addr=0x{aux:X16} q0=0x{result0:X16} q1=0x{result1:X16}");
+        }
     }
 }

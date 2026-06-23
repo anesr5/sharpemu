@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.Fiber;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -32,6 +33,8 @@ public static class KernelRuntimeCompatExports
     private const ulong DefaultKernelTscFrequency = 10_000_000UL;
     private const ulong PrtAreaStartAddress = 0x0000001000000000UL;
     private const ulong PrtAreaSize = 0x000000EC00000000UL;
+    private const int MapFlagFixed = 0x10;
+    private const ulong DefaultVirtualRangeAlignment = 0x4000UL;
     private const int AioInitParamSize = 0x3C;
     private const uint MemCommit = 0x1000;
     private const uint MemReserve = 0x2000;
@@ -73,6 +76,8 @@ public static class KernelRuntimeCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        GuestThreadExecution.Scheduler?.Pump(ctx, "sceKernelUsleep");
+
         if (micros < 1000)
         {
             Thread.Yield();
@@ -108,8 +113,14 @@ public static class KernelRuntimeCompatExports
             lockText = $"0x{lockValue:X16}";
         }
 
+        var returnRip = GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame)
+            ? frame.ReturnRip
+            : 0UL;
+        var thread = GuestThreadExecution.CurrentGuestThreadHandle;
+        var fiber = FiberExports.GetCurrentFiberAddressForDiagnostics(ctx);
+
         Console.Error.WriteLine(
-            $"[LOADER][TRACE] usleep#{count}: usec={micros} rbx=0x{rbx:X16} lock@+F78=0x{lockAddress:X16}:{lockText} r13=0x{ctx[CpuRegister.R13]:X16} r14=0x{ctx[CpuRegister.R14]:X16} r15=0x{ctx[CpuRegister.R15]:X16}");
+            $"[LOADER][TRACE] usleep#{count}: usec={micros} ret=0x{returnRip:X16} thread=0x{thread:X16} fiber=0x{fiber:X16} rbx=0x{rbx:X16} lock@+F78=0x{lockAddress:X16}:{lockText} r13=0x{ctx[CpuRegister.R13]:X16} r14=0x{ctx[CpuRegister.R14]:X16} r15=0x{ctx[CpuRegister.R15]:X16}");
     }
 
     [SysAbiExport(
@@ -653,7 +664,7 @@ public static class KernelRuntimeCompatExports
     {
         var inOutAddressPointer = ctx[CpuRegister.Rdi];
         var length = ctx[CpuRegister.Rsi];
-        var _flags = ctx[CpuRegister.Rdx];
+        var flags = unchecked((int)ctx[CpuRegister.Rdx]);
         var alignment = ctx[CpuRegister.Rcx];
         if (inOutAddressPointer == 0 || length == 0)
         {
@@ -665,7 +676,8 @@ public static class KernelRuntimeCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        var effectiveAlignment = alignment == 0 ? 0x10000UL : alignment;
+        var effectiveAlignment = alignment == 0 ? DefaultVirtualRangeAlignment : alignment;
+        var fixedMapping = (flags & MapFlagFixed) != 0;
         ulong desiredAddress;
         lock (_stateGate)
         {
@@ -674,13 +686,13 @@ public static class KernelRuntimeCompatExports
                 : AlignUp(_nextReservedVirtualBase, effectiveAlignment);
         }
 
-        if (!TryReserveVirtualRange(ctx, desiredAddress, length, out var mappedAddress))
+        if (!TryReserveVirtualRange(ctx, desiredAddress, length, effectiveAlignment, allowSearch: !fixedMapping, out var mappedAddress))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
         Console.Error.WriteLine(
-            $"[LOADER][TRACE] reserve_virtual_range: req=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} mapped=0x{mappedAddress:X16} len=0x{length:X16}");
+            $"[LOADER][TRACE] reserve_virtual_range: req=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} mapped=0x{mappedAddress:X16} len=0x{length:X16} flags=0x{flags:X8} align=0x{effectiveAlignment:X16}");
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
         {
@@ -964,14 +976,12 @@ public static class KernelRuntimeCompatExports
     public static int StackCheckFail(CpuContext ctx)
     {
         var count = Interlocked.Increment(ref _stackChkFailCount);
-        if (count <= 8)
-        {
-            Console.Error.WriteLine(
-                $"[LOADER][WARNING] __stack_chk_fail recovery#{count}: rip=0x{ctx.Rip:X16} rdi=0x{ctx[CpuRegister.Rdi]:X16}");
-        }
-
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        Console.Error.WriteLine(
+            $"[LOADER][ERROR] __stack_chk_fail#{count}: rip=0x{ctx.Rip:X16} rdi=0x{ctx[CpuRegister.Rdi]:X16}");
+        var result = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_CPU_TRAP;
+        GuestThreadExecution.RequestCurrentEntryExit("__stack_chk_fail", result);
+        ctx[CpuRegister.Rax] = unchecked((ulong)result);
+        return result;
     }
 
     [SysAbiExport(
@@ -1656,7 +1666,13 @@ public static class KernelRuntimeCompatExports
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern nint VirtualAlloc(nint lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
 
-    private static bool TryReserveVirtualRange(CpuContext ctx, ulong desiredAddress, ulong length, out ulong mappedAddress)
+    private static bool TryReserveVirtualRange(
+        CpuContext ctx,
+        ulong desiredAddress,
+        ulong length,
+        ulong alignment,
+        bool allowSearch,
+        out ulong mappedAddress)
     {
         mappedAddress = 0;
         if (length == 0)
@@ -1668,40 +1684,51 @@ public static class KernelRuntimeCompatExports
         {
             object memoryObject = ctx.Memory;
             MethodInfo? allocateAt = null;
+            MethodInfo? allocateAtOrAbove = null;
             var allocateAtHasAllowAlternativeArg = false;
             for (var depth = 0; depth < 4; depth++)
             {
                 foreach (var candidate in memoryObject.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
                 {
-                    if (!string.Equals(candidate.Name, "AllocateAt", StringComparison.Ordinal))
-                    {
-                        continue;
-                    }
-
                     var parameters = candidate.GetParameters();
-                    if (parameters.Length == 3 &&
-                        parameters[0].ParameterType == typeof(ulong) &&
-                        parameters[1].ParameterType == typeof(ulong) &&
-                        parameters[2].ParameterType == typeof(bool))
-                    {
-                        allocateAt = candidate;
-                        allocateAtHasAllowAlternativeArg = false;
-                        break;
-                    }
-
-                    if (parameters.Length == 4 &&
+                    if (string.Equals(candidate.Name, "TryAllocateAtOrAbove", StringComparison.Ordinal) &&
+                        parameters.Length == 5 &&
                         parameters[0].ParameterType == typeof(ulong) &&
                         parameters[1].ParameterType == typeof(ulong) &&
                         parameters[2].ParameterType == typeof(bool) &&
-                        parameters[3].ParameterType == typeof(bool))
+                        parameters[3].ParameterType == typeof(ulong) &&
+                        parameters[4].ParameterType == typeof(ulong).MakeByRefType())
                     {
-                        allocateAt = candidate;
-                        allocateAtHasAllowAlternativeArg = true;
+                        allocateAtOrAbove = candidate;
+                    }
+                    else if (string.Equals(candidate.Name, "AllocateAt", StringComparison.Ordinal))
+                    {
+                        if (parameters.Length == 3 &&
+                            parameters[0].ParameterType == typeof(ulong) &&
+                            parameters[1].ParameterType == typeof(ulong) &&
+                            parameters[2].ParameterType == typeof(bool))
+                        {
+                            allocateAt = candidate;
+                            allocateAtHasAllowAlternativeArg = false;
+                        }
+                        else if (parameters.Length == 4 &&
+                            parameters[0].ParameterType == typeof(ulong) &&
+                            parameters[1].ParameterType == typeof(ulong) &&
+                            parameters[2].ParameterType == typeof(bool) &&
+                            parameters[3].ParameterType == typeof(bool))
+                        {
+                            allocateAt = candidate;
+                            allocateAtHasAllowAlternativeArg = true;
+                        }
+                    }
+
+                    if (allocateAtOrAbove is not null && allocateAt is not null)
+                    {
                         break;
                     }
                 }
 
-                if (allocateAt is not null)
+                if (allocateAtOrAbove is not null || allocateAt is not null)
                 {
                     break;
                 }
@@ -1721,6 +1748,18 @@ public static class KernelRuntimeCompatExports
                 memoryObject = innerValue;
             }
 
+            if (allowSearch && allocateAtOrAbove is not null)
+            {
+                var searchArgs = new object[] { desiredAddress, length, false, alignment, 0UL };
+                var searchResult = allocateAtOrAbove.Invoke(memoryObject, searchArgs);
+                if (searchResult is bool trueValue && trueValue &&
+                    searchArgs[4] is ulong searchedAddress && searchedAddress != 0)
+                {
+                    mappedAddress = searchedAddress;
+                    return true;
+                }
+            }
+
             if (allocateAt is null)
             {
                 Console.Error.WriteLine($"[LOADER][TRACE] reserve_virtual_range: AllocateAt missing on {ctx.Memory.GetType().FullName}");
@@ -1728,7 +1767,7 @@ public static class KernelRuntimeCompatExports
             }
 
             var invokeArgs = allocateAtHasAllowAlternativeArg
-                ? new object[] { desiredAddress, length, false, true }
+                ? new object[] { desiredAddress, length, false, false }
                 : new object[] { desiredAddress, length, false };
             var result = allocateAt.Invoke(memoryObject, invokeArgs);
             if (result is not ulong allocated || allocated == 0)
