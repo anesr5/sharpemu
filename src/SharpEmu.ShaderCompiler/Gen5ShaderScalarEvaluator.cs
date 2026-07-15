@@ -43,6 +43,7 @@ public static class Gen5ShaderScalarEvaluator
     private static readonly Dictionary<int, Queue<CachedGlobalRead>> _recycledReads = new();
     private static long _recycledReadBytes;
     private static readonly Dictionary<ulong, HashSet<uint>> _runtimeScalarRegisterCache = new();
+    private const int MaxEvalSkeletonEntries = 2048;
     private static readonly object _evalSkeletonGate = new();
     private static readonly Dictionary<
         (ulong Program, ulong UserData, bool ResolveVertex, uint VertexBucket),
@@ -521,6 +522,12 @@ public static class Gen5ShaderScalarEvaluator
         var ownedRuntime = new HashSet<uint>(runtimeScalarRegisters);
         lock (_evalSkeletonGate)
         {
+            if (_evalSkeletonCache.Count >= MaxEvalSkeletonEntries &&
+                !_evalSkeletonCache.ContainsKey(skeletonKey))
+            {
+                _evalSkeletonCache.Clear();
+            }
+
             _evalSkeletonCache[skeletonKey] = new EvalSkeleton
             {
                 InitialScalarRegisters = ownedInitial,
