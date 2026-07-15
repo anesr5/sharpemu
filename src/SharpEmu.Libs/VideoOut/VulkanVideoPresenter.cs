@@ -1117,6 +1117,13 @@ internal static unsafe class VulkanVideoPresenter
                 latest.Sequence == presentedSequence ||
                 latest.RequiredGuestWorkSequence > _completedGuestWorkSequence)
             {
+                if (PerfLog.Enabled &&
+                    _latestPresentation is { } pending &&
+                    pending.Sequence != presentedSequence)
+                {
+                    Interlocked.Increment(ref PerfLog.PresentSkipsNotReady);
+                }
+
                 presentation = default;
                 return false;
             }
@@ -6023,6 +6030,16 @@ internal static unsafe class VulkanVideoPresenter
         [return: MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
         private static extern bool CloseHandle(nint handle);
 
+        private bool HasReadyPresentation()
+        {
+            lock (_gate)
+            {
+                return _latestPresentation is { } latest &&
+                       latest.Sequence != _presentedSequence &&
+                       latest.RequiredGuestWorkSequence <= _completedGuestWorkSequence;
+            }
+        }
+
         private void WaitForRenderWork()
         {
             var gpuWorkInFlight = _pendingGuestSubmissions.Count > 0 || _presentationInFlight;
@@ -6065,6 +6082,7 @@ internal static unsafe class VulkanVideoPresenter
 
             var completedWork = 0;
             while (completedWork < MaxGuestWorkPerRender &&
+                   !HasReadyPresentation() &&
                    TryTakeGuestWork(out var work))
             {
                 try
