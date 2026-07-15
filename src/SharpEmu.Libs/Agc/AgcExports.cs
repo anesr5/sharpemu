@@ -7,7 +7,9 @@ using SharpEmu.Libs.Gpu;
 using SharpEmu.ShaderCompiler;
 using SharpEmu.Libs.Kernel;
 using SharpEmu.Libs.VideoOut;
+using SharpEmu.Logging;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -2680,6 +2682,11 @@ public static class AgcExports
             return;
         }
 
+        if (PerfLog.Enabled)
+        {
+            Interlocked.Increment(ref PerfLog.DcbSubmits);
+        }
+
         var offset = 0u;
         while (offset < dwordCount)
         {
@@ -3417,6 +3424,7 @@ public static class AgcExports
         }
 
         var translationError = string.Empty;
+        var translateStart = PerfLog.Enabled ? Stopwatch.GetTimestamp() : 0L;
         if (hasExportShader &&
             hasPixelShader &&
             hasPsInputEna &&
@@ -3431,6 +3439,14 @@ public static class AgcExports
                 out var translatedDraw,
                 out translationError))
         {
+            if (PerfLog.Enabled)
+            {
+                Interlocked.Increment(ref PerfLog.DrawsTranslated);
+                Interlocked.Add(
+                    ref PerfLog.ShaderEvalTicks,
+                    Stopwatch.GetTimestamp() - translateStart);
+            }
+
             state.TranslatedDraw = translatedDraw;
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
             if (firstTarget.Address != 0)
@@ -3622,6 +3638,14 @@ public static class AgcExports
             pixelEvaluation.GlobalMemoryBindings.Count +
             exportEvaluation.GlobalMemoryBindings.Count;
         _graphicsShaderCache.TryGetValue(shaderKey, out var compiled);
+
+        if (PerfLog.Enabled)
+        {
+            Interlocked.Increment(
+                ref compiled.Vertex is null || compiled.Pixel is null
+                    ? ref PerfLog.SpirvCacheMisses
+                    : ref PerfLog.SpirvCacheHits);
+        }
 
         if (compiled.Vertex is null || compiled.Pixel is null)
         {
@@ -4518,6 +4542,11 @@ public static class AgcExports
             return true;
         }
 
+        if (PerfLog.Enabled)
+        {
+            Interlocked.Add(ref PerfLog.GuestTextureBytesRead, source.Length);
+        }
+
         TraceTextureHash(descriptor, source);
 
         if (_traceAgcShader)
@@ -4965,6 +4994,14 @@ public static class AgcExports
                 localSizeY,
                 localSizeZ);
             _computeShaderCache.TryGetValue(shaderKey, out var computeShader);
+
+            if (PerfLog.Enabled)
+            {
+                Interlocked.Increment(
+                    ref computeShader is null
+                        ? ref PerfLog.SpirvCacheMisses
+                        : ref PerfLog.SpirvCacheHits);
+            }
 
             if (computeShader is null &&
                 GuestGpu.Current.TryCompileComputeShader(

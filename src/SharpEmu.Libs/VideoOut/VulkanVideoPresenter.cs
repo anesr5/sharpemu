@@ -6,6 +6,7 @@ using Silk.NET.Core.Native;
 using Silk.NET.Maths;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
+using SharpEmu.Logging;
 using Silk.NET.Input;
 using SharpEmu.Libs.Gpu;
 using SharpEmu.ShaderCompiler;
@@ -2371,9 +2372,16 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var fence = _presentationFence;
+            var waitStart = wait && PerfLog.Enabled ? Stopwatch.GetTimestamp() : 0L;
             var result = wait
                 ? _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue)
                 : _vk.GetFenceStatus(_device, fence);
+            if (waitStart != 0)
+            {
+                Interlocked.Add(
+                    ref PerfLog.PresentFenceWaitTicks,
+                    Stopwatch.GetTimestamp() - waitStart);
+            }
             if (!wait && result == Result.NotReady)
             {
                 return;
@@ -3351,6 +3359,10 @@ internal static unsafe class VulkanVideoPresenter
                     resources.Pipeline = pipeline;
                     resources.PipelineCached = true;
                     _graphicsPipelines.Add(pipelineKey, pipeline);
+                    if (PerfLog.Enabled)
+                    {
+                        Interlocked.Increment(ref PerfLog.PipelinesCreated);
+                    }
                     SetDebugName(
                         ObjectType.Pipeline,
                         pipeline.Handle,
@@ -6058,12 +6070,21 @@ internal static unsafe class VulkanVideoPresenter
                             break;
                         case VulkanComputeGuestDispatch computeDispatch:
                             ExecuteComputeDispatch(computeDispatch);
+                            if (PerfLog.Enabled)
+                            {
+                                Interlocked.Increment(ref PerfLog.ComputeDispatches);
+                            }
+
                             break;
                     }
                 }
                 finally
                 {
                     CompleteGuestWork();
+                    if (PerfLog.Enabled)
+                    {
+                        Interlocked.Increment(ref PerfLog.GuestWorkExecuted);
+                    }
                 }
 
                 completedWork++;
@@ -6304,6 +6325,10 @@ internal static unsafe class VulkanVideoPresenter
             recreateAfterPresent |= presentResult == Result.SuboptimalKhr;
             VideoOutExports.ReportPresentedFrame();
             _performanceHudPresentedFrames++;
+            if (PerfLog.Enabled)
+            {
+                Interlocked.Increment(ref PerfLog.FramesPresented);
+            }
             if (_swapchainReadbackPending)
             {
                 CompletePendingPresentation(wait: true);

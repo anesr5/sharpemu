@@ -1201,6 +1201,11 @@ public static class VideoOutExports
             }
         }
 
+        if (PerfLog.Enabled)
+        {
+            Interlocked.Increment(ref PerfLog.FlipsSubmitted);
+        }
+
         var guestImageSubmitted = false;
         ulong guestImageAddress = 0;
         if (submitGpuImage &&
