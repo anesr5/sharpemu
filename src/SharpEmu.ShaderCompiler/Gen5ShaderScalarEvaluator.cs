@@ -42,11 +42,32 @@ public static class Gen5ShaderScalarEvaluator
     private static long _crossFrameReadCacheBytes;
     private static readonly Dictionary<int, Queue<CachedGlobalRead>> _recycledReads = new();
     private static long _recycledReadBytes;
+    private static readonly Dictionary<ulong, HashSet<uint>> _runtimeScalarRegisterCache = new();
+    private static readonly object _evalSkeletonGate = new();
+    private static readonly Dictionary<
+        (ulong Program, ulong UserData, bool ResolveVertex, uint VertexBucket),
+        EvalSkeleton> _evalSkeletonCache = new();
+
+    [ThreadStatic] private static uint[]? _scalarRegisterScratch;
+    [ThreadStatic] private static uint[]? _initialScalarRegisterScratch;
+    [ThreadStatic] private static List<(ulong Address, uint Value)>? _evalLoadProbes;
+    [ThreadStatic] private static bool _recordEvalLoads;
 
     private sealed class CachedGlobalRead
     {
         public byte[] Data = [];
         public long LastUseSequence;
+    }
+
+    private sealed class EvalSkeleton
+    {
+        public required uint[] InitialScalarRegisters;
+        public required uint[] ScalarRegisters;
+        public required Gen5ImageBinding[] ImageBindings;
+        public required (uint ScalarAddress, ulong BaseAddress, int SizeBytes, uint[] Pcs)[] Globals;
+        public required (Gen5VertexInputBinding Template, int SizeBytes)[] VertexInputs;
+        public required (ulong Address, uint Value)[] Probes;
+        public required HashSet<uint> RuntimeScalarRegisters;
     }
 
     private static void RecycleReadLocked(CachedGlobalRead entry)
@@ -133,7 +154,22 @@ public static class Gen5ShaderScalarEvaluator
     {
         evaluation = default!;
         error = string.Empty;
-        var scalarRegisters = new uint[ScalarRegisterCount];
+        var userDataFingerprint = FingerprintUserData(state);
+        var vertexBucket = vertexRecordLimit is null
+            ? 0u
+            : (vertexRecordLimit.Value + 63u) / 64u;
+        var skeletonKey = (
+            state.Program.Address,
+            userDataFingerprint,
+            resolveVertexInputs,
+            vertexBucket);
+        if (TryRefreshEvalSkeleton(ctx, state, skeletonKey, out evaluation))
+        {
+            return true;
+        }
+
+        var scalarRegisters = _scalarRegisterScratch ??= new uint[ScalarRegisterCount];
+        scalarRegisters.AsSpan().Clear();
         for (var index = 0;
              index < state.UserData.Count &&
              state.UserDataScalarRegisterBase + (uint)index < scalarRegisters.Length;
@@ -151,13 +187,19 @@ public static class Gen5ShaderScalarEvaluator
         var execMask = RdnaWaveMask;
         WriteScalarPair(scalarRegisters, 106, 0, ref execMask);
         WriteScalarPair(scalarRegisters, 126, execMask, ref execMask);
-        var initialScalarRegisters = (uint[])scalarRegisters.Clone();
+        var initialScalarRegisters = _initialScalarRegisterScratch ??= new uint[ScalarRegisterCount];
+        scalarRegisters.AsSpan().CopyTo(initialScalarRegisters);
 
         var resolved = new List<Gen5ImageBinding>();
         var globalMemoryBindings = new List<Gen5GlobalMemoryBinding>();
         var globalMemoryByAddress = new Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding>();
         var vertexInputBindings = new List<Gen5VertexInputBinding>();
         var runtimeScalarRegisters = CollectRuntimeScalarRegisters(state.Program);
+        var probes = _evalLoadProbes ??= new List<(ulong, uint)>(64);
+        probes.Clear();
+        _recordEvalLoads = true;
+        try
+        {
         var scalarConditionCode = false;
         uint? skipUntilPc = null;
 
@@ -472,14 +514,124 @@ public static class Gen5ShaderScalarEvaluator
                     : null));
         }
 
+        var ownedInitial = (uint[])initialScalarRegisters.Clone();
+        var ownedFinal = (uint[])scalarRegisters.Clone();
+        var ownedImages = resolved.ToArray();
+        var ownedVertices = vertexInputBindings.ToArray();
+        var ownedRuntime = new HashSet<uint>(runtimeScalarRegisters);
+        lock (_evalSkeletonGate)
+        {
+            _evalSkeletonCache[skeletonKey] = new EvalSkeleton
+            {
+                InitialScalarRegisters = ownedInitial,
+                ScalarRegisters = ownedFinal,
+                ImageBindings = ownedImages,
+                Globals = globalMemoryBindings
+                    .Select(binding => (
+                        binding.ScalarAddress,
+                        binding.BaseAddress,
+                        binding.Data.Length,
+                        binding.InstructionPcs as uint[] ?? binding.InstructionPcs.ToArray()))
+                    .ToArray(),
+                VertexInputs = ownedVertices
+                    .Select(binding => (binding with { Data = [] }, binding.Data.Length))
+                    .ToArray(),
+                Probes = probes.ToArray(),
+                RuntimeScalarRegisters = ownedRuntime,
+            };
+        }
+
         evaluation = new Gen5ShaderEvaluation(
-            initialScalarRegisters,
-            scalarRegisters,
-            resolved,
+            ownedInitial,
+            ownedFinal,
+            ownedImages,
             globalMemoryBindings,
             state.ComputeSystemRegisters,
-            runtimeScalarRegisters,
-            vertexInputBindings);
+            ownedRuntime,
+            ownedVertices);
+        return true;
+        }
+        finally
+        {
+            _recordEvalLoads = false;
+        }
+    }
+
+    private static ulong FingerprintUserData(Gen5ShaderState state)
+    {
+        const ulong offset = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+        var hash = offset ^ state.UserDataScalarRegisterBase;
+        hash = (hash ^ (ulong)state.UserData.Count) * prime;
+        foreach (var value in state.UserData)
+        {
+            hash = (hash ^ value) * prime;
+        }
+
+        return hash;
+    }
+
+    private static bool TryRefreshEvalSkeleton(
+        CpuContext ctx,
+        Gen5ShaderState state,
+        (ulong Program, ulong UserData, bool ResolveVertex, uint VertexBucket) key,
+        out Gen5ShaderEvaluation evaluation)
+    {
+        evaluation = default!;
+        EvalSkeleton skeleton;
+        lock (_evalSkeletonGate)
+        {
+            if (!_evalSkeletonCache.TryGetValue(key, out skeleton!))
+            {
+                return false;
+            }
+        }
+
+        foreach (var (address, value) in skeleton.Probes)
+        {
+            if (!ctx.TryReadUInt32(address, out var current) || current != value)
+            {
+                return false;
+            }
+        }
+
+        var globals = new List<Gen5GlobalMemoryBinding>(skeleton.Globals.Length);
+        foreach (var (scalarAddress, baseAddress, sizeBytes, pcs) in skeleton.Globals)
+        {
+            if (sizeBytes <= 0 ||
+                !TryReadGlobalMemory(ctx, baseAddress, (ulong)sizeBytes, out var data))
+            {
+                return false;
+            }
+
+            globals.Add(new Gen5GlobalMemoryBinding(scalarAddress, baseAddress, pcs, data));
+        }
+
+        Gen5VertexInputBinding[]? vertices = null;
+        if (key.ResolveVertex)
+        {
+            vertices = new Gen5VertexInputBinding[skeleton.VertexInputs.Length];
+            for (var index = 0; index < skeleton.VertexInputs.Length; index++)
+            {
+                var (template, sizeBytes) = skeleton.VertexInputs[index];
+                if (sizeBytes <= 0 ||
+                    !TryReadGlobalMemory(ctx, template.BaseAddress, (ulong)sizeBytes, out var data))
+                {
+                    return false;
+                }
+
+                vertices[index] = template with { Data = data };
+            }
+        }
+
+        evaluation = new Gen5ShaderEvaluation(
+            skeleton.InitialScalarRegisters,
+            skeleton.ScalarRegisters,
+            skeleton.ImageBindings,
+            globals,
+            state.ComputeSystemRegisters,
+            skeleton.RuntimeScalarRegisters,
+            vertices);
         return true;
     }
 
@@ -532,6 +684,14 @@ public static class Gen5ShaderScalarEvaluator
 
     private static HashSet<uint> CollectRuntimeScalarRegisters(Gen5ShaderProgram program)
     {
+        lock (_runtimeScalarRegisterCache)
+        {
+            if (_runtimeScalarRegisterCache.TryGetValue(program.Address, out var cached))
+            {
+                return new HashSet<uint>(cached);
+            }
+        }
+
         var registers = new HashSet<uint>();
         foreach (var instruction in program.Instructions)
         {
@@ -554,7 +714,20 @@ public static class Gen5ShaderScalarEvaluator
             }
         }
 
+        lock (_runtimeScalarRegisterCache)
+        {
+            _runtimeScalarRegisterCache[program.Address] = new HashSet<uint>(registers);
+        }
+
         return registers;
+    }
+
+    private static void RecordEvalLoad(ulong address, uint value)
+    {
+        if (_recordEvalLoads)
+        {
+            (_evalLoadProbes ??= new List<(ulong, uint)>(64)).Add((address, value));
+        }
     }
 
     private static bool TryGetSoppBranchTargetPc(
@@ -1629,16 +1802,19 @@ public static class Gen5ShaderScalarEvaluator
                 continue;
             }
 
-            if (!ctx.TryReadUInt32(
-                    address + (ulong)(index * sizeof(uint)),
-                    out var value) &&
-                !TryReadUserDataScalarLoad(
-                    state,
-                    instruction,
-                    control,
-                    byteOffset,
-                    index,
-                    out value))
+            var loadAddress = address + (ulong)(index * sizeof(uint));
+            uint value;
+            if (ctx.TryReadUInt32(loadAddress, out value))
+            {
+                RecordEvalLoad(loadAddress, value);
+            }
+            else if (!TryReadUserDataScalarLoad(
+                         state,
+                         instruction,
+                         control,
+                         byteOffset,
+                         index,
+                         out value))
             {
                 if (isBufferLoad)
                 {
