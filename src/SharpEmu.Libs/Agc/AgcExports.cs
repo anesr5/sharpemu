@@ -4,8 +4,10 @@
 using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
 using SharpEmu.Libs.VideoOut;
+using SharpEmu.Logging;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -2659,6 +2661,11 @@ public static class AgcExports
             return;
         }
 
+        if (PerfLog.Enabled)
+        {
+            Interlocked.Increment(ref PerfLog.DcbSubmits);
+        }
+
         var offset = 0u;
         while (offset < dwordCount)
         {
@@ -3392,6 +3399,7 @@ public static class AgcExports
         }
 
         var translationError = string.Empty;
+        var translateStart = PerfLog.Enabled ? Stopwatch.GetTimestamp() : 0L;
         if (hasExportShader &&
             hasPixelShader &&
             hasPsInputEna &&
@@ -3406,6 +3414,14 @@ public static class AgcExports
                 out var translatedDraw,
                 out translationError))
         {
+            if (PerfLog.Enabled)
+            {
+                Interlocked.Increment(ref PerfLog.DrawsTranslated);
+                Interlocked.Add(
+                    ref PerfLog.ShaderEvalTicks,
+                    Stopwatch.GetTimestamp() - translateStart);
+            }
+
             state.TranslatedDraw = translatedDraw;
             var firstTarget = translatedDraw.RenderTargets.FirstOrDefault();
             if (firstTarget.Address != 0)
@@ -3604,6 +3620,14 @@ public static class AgcExports
         lock (_submitTraceGate)
         {
             _graphicsSpirvCache.TryGetValue(shaderKey, out compiled);
+        }
+
+        if (PerfLog.Enabled)
+        {
+            Interlocked.Increment(
+                ref compiled.Vertex is null || compiled.Pixel is null
+                    ? ref PerfLog.SpirvCacheMisses
+                    : ref PerfLog.SpirvCacheHits);
         }
 
         if (compiled.Vertex is null || compiled.Pixel is null)
@@ -4483,6 +4507,11 @@ public static class AgcExports
             return true;
         }
 
+        if (PerfLog.Enabled)
+        {
+            Interlocked.Add(ref PerfLog.GuestTextureBytesRead, source.Length);
+        }
+
         TraceTextureHash(descriptor, source);
 
         if (_traceAgcShader)
@@ -4933,6 +4962,14 @@ public static class AgcExports
             lock (_submitTraceGate)
             {
                 _computeSpirvCache.TryGetValue(shaderKey, out computeSpirv!);
+            }
+
+            if (PerfLog.Enabled)
+            {
+                Interlocked.Increment(
+                    ref computeSpirv is null
+                        ? ref PerfLog.SpirvCacheMisses
+                        : ref PerfLog.SpirvCacheHits);
             }
 
             if (computeSpirv is null &&

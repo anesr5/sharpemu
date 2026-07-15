@@ -197,7 +197,7 @@ internal static partial class Program
             return childExitCode;
         }
 
-        if (!TryParseArguments(args, out var ebootPath, out var runtimeOptions, out var logLevel, out var logFilePath))
+        if (!TryParseArguments(args, out var ebootPath, out var runtimeOptions, out var logLevel, out var logFilePath, out var perfLogPath))
         {
             PrintUsage();
             return 1;
@@ -224,6 +224,19 @@ internal static partial class Program
 
         Console.Error.WriteLine("[DEBUG] Creating runtime...");
 
+        if (!string.IsNullOrWhiteSpace(perfLogPath))
+        {
+            try
+            {
+                PerfLog.Start(perfLogPath);
+                Console.Error.WriteLine($"[DEBUG] Perf log: {Path.GetFullPath(perfLogPath)}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WARN] Could not open perf log '{perfLogPath}': {ex.Message}");
+            }
+        }
+
         using var runtime = SharpEmuRuntime.CreateDefault(runtimeOptions);
 
         OrbisGen2Result result;
@@ -249,6 +262,7 @@ internal static partial class Program
         }
         finally
         {
+            PerfLog.Stop();
             if (cancelHandler is not null)
             {
                 Console.CancelKeyPress -= cancelHandler;
@@ -613,6 +627,47 @@ internal static partial class Program
         return Path.Combine(logsDirectory, $"{name}-{DateTime.Now:yyyyMMdd-HHmmss}.log");
     }
 
+    private static string BuildDefaultPerfLogPath(string? ebootPath)
+    {
+        var name = TryReadTitleId(ebootPath);
+        if (string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(ebootPath))
+        {
+            name = Path.GetFileName(Path.GetDirectoryName(Path.GetFullPath(ebootPath)));
+        }
+
+        name = string.IsNullOrWhiteSpace(name) ? "UNKNOWN" : name;
+        foreach (var invalid in Path.GetInvalidFileNameChars())
+        {
+            name = name.Replace(invalid, '_');
+        }
+
+        return Path.Combine(
+            AppContext.BaseDirectory,
+            $"{name}-perf-{DateTime.Now:yyyyMMdd-HHmmss}.csv");
+    }
+
+    private static bool ShouldConsumePerfLogPath(IReadOnlyList<string> args, int candidateIndex)
+    {
+        if (string.Equals(
+                Path.GetExtension(args[candidateIndex]),
+                ".csv",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        for (var i = candidateIndex + 1; i < args.Count; i++)
+        {
+            if (!string.IsNullOrWhiteSpace(args[i]) &&
+                !args[i].StartsWith("--", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static string? TryReadTitleId(string? ebootPath)
     {
         if (string.IsNullOrWhiteSpace(ebootPath))
@@ -900,7 +955,7 @@ internal static partial class Program
 
     private static void PrintUsage()
     {
-        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] [--log-file[=<path>]] <path-to-eboot.bin>");
+        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] [--log-file[=<path>]] [--perf-logs[=<path.csv>]] <path-to-eboot.bin>");
         Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug --log-file ""E:\Games\...\eboot.bin""");
     }
 
@@ -909,7 +964,8 @@ internal static partial class Program
         out string ebootPath,
         out SharpEmuRuntimeOptions runtimeOptions,
         out LogLevel logLevel,
-        out string? logFilePath)
+        out string? logFilePath,
+        out string? perfLogPath)
     {
         if (args.Length == 0)
         {
@@ -917,6 +973,7 @@ internal static partial class Program
             runtimeOptions = default;
             logLevel = SharpEmuLog.MinimumLevel;
             logFilePath = null;
+            perfLogPath = null;
             return false;
         }
 
@@ -924,6 +981,7 @@ internal static partial class Program
         var importTraceLimit = 0;
         var cpuEngine = CpuExecutionEngine.NativeOnly;
         logFilePath = null;
+        perfLogPath = null;
         logLevel = SharpEmuLog.MinimumLevel;
         var pathTokens = new List<string>(args.Length);
         for (var i = 0; i < args.Length; i++)
@@ -987,6 +1045,35 @@ internal static partial class Program
                 else
                 {
                     logFilePath = BuildDefaultLogFilePath(TryFindEbootPathToken(args));
+                }
+
+                continue;
+            }
+
+            if (string.Equals(argument, "--perf-logs", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length &&
+                    !string.IsNullOrWhiteSpace(args[i + 1]) &&
+                    !args[i + 1].StartsWith("--", StringComparison.Ordinal) &&
+                    ShouldConsumePerfLogPath(args, i + 1))
+                {
+                    perfLogPath = args[++i];
+                }
+                else
+                {
+                    perfLogPath = BuildDefaultPerfLogPath(TryFindEbootPathToken(args));
+                }
+
+                continue;
+            }
+
+            const string perfLogPrefix = "--perf-logs=";
+            if (argument.StartsWith(perfLogPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                perfLogPath = argument[perfLogPrefix.Length..];
+                if (string.IsNullOrWhiteSpace(perfLogPath))
+                {
+                    perfLogPath = BuildDefaultPerfLogPath(TryFindEbootPathToken(args));
                 }
 
                 continue;
