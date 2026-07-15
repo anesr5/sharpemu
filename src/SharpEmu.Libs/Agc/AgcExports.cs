@@ -192,6 +192,7 @@ public static class AgcExports
     private static long _standardDmaTraceCount;
     private static readonly object _softwarePresenterGate = new();
     private static readonly Dictionary<(ulong Source, ulong Destination), ulong> _softwarePresenterFingerprints = new();
+    private static byte[] _softwarePresentSourceScratch = [];
     private static readonly object _textureSourceGate = new();
     private static readonly Dictionary<(ulong Address, int ByteCount), CachedTextureSource> _textureSourceCache = new();
     private static byte[] _textureSourceScratch = [];
@@ -204,6 +205,10 @@ public static class AgcExports
         public ulong Fingerprint;
         public long LastUseSequence;
     }
+
+    private static readonly Dictionary<(ulong Address, int ByteCount), CachedTextureSource> _indexSourceCache = new();
+    private static long _indexSourceCacheBytes;
+    private const long MaxIndexSourceCacheBytes = 256L * 1024 * 1024;
     private static readonly Dictionary<(ulong Shader, ulong Source, ulong Destination), ulong> _softwareComputeBlitFingerprints = new();
     private static readonly object _registerDefaultsGate = new();
     private static readonly ConditionalWeakTable<object, RegisterDefaultsAllocation> _registerDefaultsAllocations = new();
@@ -2968,6 +2973,11 @@ public static class AgcExports
                         cachedDisplayBuffer.Height,
                         cachedDisplayBuffer.PitchInPixel))
                 {
+                    if (PerfLog.Enabled)
+                    {
+                        Interlocked.Increment(ref PerfLog.FlipGpuCache);
+                    }
+
                     TraceDisplayBuffer(
                         handle,
                         displayBufferIndex,
@@ -2981,6 +2991,11 @@ public static class AgcExports
                         displayBufferIndex,
                         out var translatedDisplayBuffer))
                 {
+                    if (PerfLog.Enabled)
+                    {
+                        Interlocked.Increment(ref PerfLog.FlipDrawFallback);
+                    }
+
                     TraceDisplayBuffer(
                         handle,
                         displayBufferIndex,
@@ -3020,6 +3035,11 @@ public static class AgcExports
                 }
                 else if (state.SawIndexedDraw && state.PresenterTexture is { } sourceTexture)
                 {
+                    if (PerfLog.Enabled)
+                    {
+                        Interlocked.Increment(ref PerfLog.FlipSoftware);
+                    }
+
                     _ = TrySoftwarePresent(
                         ctx,
                         sourceTexture,
@@ -3033,10 +3053,19 @@ public static class AgcExports
                              displayBufferIndex,
                              out var displayBuffer))
                 {
+                    if (PerfLog.Enabled)
+                    {
+                        Interlocked.Increment(ref PerfLog.FlipGuestDraw);
+                    }
+
                     VulkanVideoPresenter.SubmitGuestDraw(
                         state.GuestDrawKind,
                         displayBuffer.Width,
                         displayBuffer.Height);
+                }
+                else if (PerfLog.Enabled)
+                {
+                    Interlocked.Increment(ref PerfLog.FlipUnhandled);
                 }
 
                 _ = VideoOutExports.SubmitFlipFromAgc(ctx, handle, displayBufferIndex, unchecked((int)flipMode), flipArg);
@@ -3808,8 +3837,40 @@ public static class AgcExports
         var bytesPerIndex = is32Bit ? sizeof(uint) : sizeof(ushort);
         var byteOffset = checked((ulong)state.DrawIndexOffset * (uint)bytesPerIndex);
         var byteCount = checked((int)(indexCount * (uint)bytesPerIndex));
-        var data = GC.AllocateUninitializedArray<byte>(byteCount);
         var address = state.IndexBufferAddress + byteOffset;
+        var key = (address, byteCount);
+        byte[] data;
+        lock (_indexSourceCache)
+        {
+            if (_indexSourceCache.TryGetValue(key, out var cached) &&
+                VulkanVideoPresenter.CompletedGuestWorkSequence >= cached.LastUseSequence)
+            {
+                cached.LastUseSequence = VulkanVideoPresenter.EnqueuedGuestWorkSequence + 1;
+                data = cached.Pixels;
+            }
+            else
+            {
+                data = GC.AllocateUninitializedArray<byte>(byteCount);
+                if (_indexSourceCache.Remove(key, out var evicted))
+                {
+                    _indexSourceCacheBytes -= evicted.Pixels.Length;
+                }
+
+                if (_indexSourceCacheBytes + byteCount > MaxIndexSourceCacheBytes)
+                {
+                    _indexSourceCache.Clear();
+                    _indexSourceCacheBytes = 0;
+                }
+
+                _indexSourceCache[key] = new CachedTextureSource
+                {
+                    Pixels = data,
+                    LastUseSequence = VulkanVideoPresenter.EnqueuedGuestWorkSequence + 1,
+                };
+                _indexSourceCacheBytes += byteCount;
+            }
+        }
+
         return (ctx.Memory.TryRead(address, data) ||
                 KernelMemoryCompatExports.TryReadTrackedLibcHeap(address, data))
             ? new VulkanGuestIndexBuffer(data, is32Bit)
@@ -5871,13 +5932,25 @@ public static class AgcExports
             return false;
         }
 
-        var sourceBytes = GC.AllocateUninitializedArray<byte>((int)sourceByteCount);
-        if (!ctx.Memory.TryRead(source.Address, sourceBytes))
+        byte[] sourceBytes;
+        lock (_softwarePresenterGate)
+        {
+            if (_softwarePresentSourceScratch.Length < (int)sourceByteCount)
+            {
+                _softwarePresentSourceScratch =
+                    GC.AllocateUninitializedArray<byte>((int)sourceByteCount);
+            }
+
+            sourceBytes = _softwarePresentSourceScratch;
+        }
+
+        var sourceSpan = sourceBytes.AsSpan(0, (int)sourceByteCount);
+        if (!ctx.Memory.TryRead(source.Address, sourceSpan))
         {
             return false;
         }
 
-        var fingerprint = ComputeFingerprint(sourceBytes);
+        var fingerprint = ComputeFingerprint(sourceSpan);
         var fingerprintKey = (source.Address, destination.Address);
         lock (_softwarePresenterGate)
         {
@@ -5900,7 +5973,7 @@ public static class AgcExports
         var rgbaDestination = destination.PixelFormat is
             VideoOutPixelFormatA8B8G8R8Srgb or
             VideoOutPixelFormatR8G8B8A8Unorm;
-        var sourcePixels = MemoryMarshal.Cast<byte, uint>(sourceBytes);
+        var sourcePixels = MemoryMarshal.Cast<byte, uint>(sourceSpan);
         for (uint y = 0; y < destination.Height; y++)
         {
             var sourceY = (uint)(((ulong)y * source.Height) / destination.Height);
@@ -5938,7 +6011,7 @@ public static class AgcExports
             _softwarePresenterFingerprints[fingerprintKey] = fingerprint;
         }
 
-        VideoOutExports.SubmitHostRgbaFrame(sourceBytes, source.Width, source.Height);
+        VideoOutExports.SubmitHostRgbaFrame(sourceSpan, source.Width, source.Height);
         TraceAgc(
             $"agc.software_presenter src=0x{source.Address:X16} {source.Width}x{source.Height} fmt={source.Format}/num{source.NumberType} " +
             $"dst=0x{destination.Address:X16} {destination.Width}x{destination.Height} fingerprint=0x{fingerprint:X16}");

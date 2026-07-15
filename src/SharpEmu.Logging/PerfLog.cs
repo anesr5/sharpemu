@@ -28,6 +28,12 @@ public static class PerfLog
     public static long GuestTextureBytesRead;
     public static long PresentFenceWaitTicks;
     public static long ShaderEvalTicks;
+    public static long FlipGpuCache;
+    public static long FlipDrawFallback;
+    public static long FlipSoftware;
+    public static long FlipGuestDraw;
+    public static long FlipUnhandled;
+    public static long PresentSkipsNotReady;
 
     private static readonly object Gate = new();
     private static StreamWriter? _writer;
@@ -57,7 +63,9 @@ public static class PerfLog
                 "dispatches_per_s,guest_work_per_s,spirv_hits_per_s,spirv_misses_per_s," +
                 "pipelines_created_total,texture_mb_read_per_s,fence_wait_ms_per_s," +
                 "shader_eval_ms_per_s,gc0_total,gc1_total,gc2_total,managed_mb," +
-                "working_set_mb,cpu_percent");
+                "alloc_mb_per_s,working_set_mb,cpu_percent," +
+                "flip_gpu_cache_per_s,flip_draw_fallback_per_s,flip_software_per_s," +
+                "flip_guest_draw_per_s,flip_unhandled_per_s,present_skips_per_s");
             _writer.Flush();
             _stopRequested = false;
             Enabled = true;
@@ -112,6 +120,13 @@ public static class PerfLog
         var lastTextureBytes = 0L;
         var lastFenceTicks = 0L;
         var lastEvalTicks = 0L;
+        var lastAllocated = 0L;
+        var lastFlipGpuCache = 0L;
+        var lastFlipDrawFallback = 0L;
+        var lastFlipSoftware = 0L;
+        var lastFlipGuestDraw = 0L;
+        var lastFlipUnhandled = 0L;
+        var lastPresentSkips = 0L;
         while (!_stopRequested)
         {
             Thread.Sleep(1000);
@@ -135,6 +150,13 @@ public static class PerfLog
             var textureBytes = Interlocked.Read(ref GuestTextureBytesRead);
             var fenceTicks = Interlocked.Read(ref PresentFenceWaitTicks);
             var evalTicks = Interlocked.Read(ref ShaderEvalTicks);
+            var allocated = GC.GetTotalAllocatedBytes(precise: false);
+            var flipGpuCache = Interlocked.Read(ref FlipGpuCache);
+            var flipDrawFallback = Interlocked.Read(ref FlipDrawFallback);
+            var flipSoftware = Interlocked.Read(ref FlipSoftware);
+            var flipGuestDraw = Interlocked.Read(ref FlipGuestDraw);
+            var flipUnhandled = Interlocked.Read(ref FlipUnhandled);
+            var presentSkips = Interlocked.Read(ref PresentSkipsNotReady);
             var cpuPercent =
                 (cpu - lastCpu).TotalSeconds / intervalSeconds / Environment.ProcessorCount * 100.0;
 
@@ -157,8 +179,15 @@ public static class PerfLog
                 $"{GC.CollectionCount(1)}," +
                 $"{GC.CollectionCount(2)}," +
                 $"{GC.GetTotalMemory(forceFullCollection: false) / (1024.0 * 1024.0):F1}," +
+                $"{(allocated - lastAllocated) / intervalSeconds / (1024.0 * 1024.0):F1}," +
                 $"{process.WorkingSet64 / (1024.0 * 1024.0):F1}," +
-                $"{cpuPercent:F1}");
+                $"{cpuPercent:F1}," +
+                $"{(flipGpuCache - lastFlipGpuCache) / intervalSeconds:F1}," +
+                $"{(flipDrawFallback - lastFlipDrawFallback) / intervalSeconds:F1}," +
+                $"{(flipSoftware - lastFlipSoftware) / intervalSeconds:F1}," +
+                $"{(flipGuestDraw - lastFlipGuestDraw) / intervalSeconds:F1}," +
+                $"{(flipUnhandled - lastFlipUnhandled) / intervalSeconds:F1}," +
+                $"{(presentSkips - lastPresentSkips) / intervalSeconds:F1}");
             lock (Gate)
             {
                 if (_writer is null)
@@ -183,6 +212,13 @@ public static class PerfLog
             lastTextureBytes = textureBytes;
             lastFenceTicks = fenceTicks;
             lastEvalTicks = evalTicks;
+            lastAllocated = allocated;
+            lastFlipGpuCache = flipGpuCache;
+            lastFlipDrawFallback = flipDrawFallback;
+            lastFlipSoftware = flipSoftware;
+            lastFlipGuestDraw = flipGuestDraw;
+            lastFlipUnhandled = flipUnhandled;
+            lastPresentSkips = presentSkips;
         }
     }
 }

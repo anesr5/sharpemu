@@ -27,15 +27,67 @@ internal static class Gen5ShaderScalarEvaluator
     internal static long GlobalMemoryReadLibcBytes;
     internal static long GlobalMemoryReadReuses;
 
-    private const long CrossFrameReadCacheMaxBytes = 1024L * 1024 * 1024;
+    private const long CrossFrameReadCacheMaxBytes = 256L * 1024 * 1024;
+    private const long MaxRecycledReadBytes = 384L * 1024 * 1024;
     private static readonly object _crossFrameReadGate = new();
     private static readonly Dictionary<(ulong BaseAddress, int SizeBytes), CachedGlobalRead> _crossFrameReadCache = new();
     private static long _crossFrameReadCacheBytes;
+    private static readonly Dictionary<int, Queue<CachedGlobalRead>> _recycledReads = new();
+    private static long _recycledReadBytes;
 
     private sealed class CachedGlobalRead
     {
         public byte[] Data = [];
         public long LastUseSequence;
+    }
+
+    private static void RecycleReadLocked(CachedGlobalRead entry)
+    {
+        if (_recycledReadBytes + entry.Data.Length > MaxRecycledReadBytes)
+        {
+            return;
+        }
+
+        if (!_recycledReads.TryGetValue(entry.Data.Length, out var pool))
+        {
+            pool = new Queue<CachedGlobalRead>();
+            _recycledReads.Add(entry.Data.Length, pool);
+        }
+
+        pool.Enqueue(entry);
+        _recycledReadBytes += entry.Data.Length;
+    }
+
+    private static CachedGlobalRead? TryTakeRecycledReadLocked(int size)
+    {
+        if (_recycledReads.TryGetValue(size, out var pool) &&
+            pool.Count > 0 &&
+            VideoOut.VulkanVideoPresenter.CompletedGuestWorkSequence >= pool.Peek().LastUseSequence)
+        {
+            var entry = pool.Dequeue();
+            _recycledReadBytes -= entry.Data.Length;
+            return entry;
+        }
+
+        return null;
+    }
+
+    private static void EvictCrossFrameReadCacheLocked(
+        Dictionary<(ulong, int), CachedGlobalRead>? submitCache)
+    {
+        var inUse = submitCache is null
+            ? null
+            : new HashSet<CachedGlobalRead>(submitCache.Values);
+        foreach (var entry in _crossFrameReadCache.Values)
+        {
+            if (inUse is null || !inUse.Contains(entry))
+            {
+                RecycleReadLocked(entry);
+            }
+        }
+
+        _crossFrameReadCache.Clear();
+        _crossFrameReadCacheBytes = 0;
     }
     private const ulong RdnaWaveMask = 0xFFFF_FFFFUL;
 
@@ -292,7 +344,7 @@ internal static class Gen5ShaderScalarEvaluator
                             (ulong)bufferMemory.DwordCount * sizeof(uint);
                         vertexReadSize = Math.Min(
                             bufferDescriptor.SizeBytes,
-                            Math.Max(requiredBytes, sizeof(uint)));
+                            (Math.Max(requiredBytes, sizeof(uint)) + 0xFFFFUL) & ~0xFFFFUL);
                     }
 
                     if (!TryReadGlobalMemory(
@@ -679,6 +731,7 @@ internal static class Gen5ShaderScalarEvaluator
                 if (_crossFrameReadCache.Remove(cacheKey))
                 {
                     _crossFrameReadCacheBytes -= previous.Data.Length;
+                    RecycleReadLocked(previous);
                 }
             }
         }
@@ -686,7 +739,17 @@ internal static class Gen5ShaderScalarEvaluator
         var candidateSize = (int)cappedSize;
         while (candidateSize >= sizeof(uint))
         {
-            data = GC.AllocateUninitializedArray<byte>(candidateSize);
+            CachedGlobalRead? entry;
+            lock (_crossFrameReadGate)
+            {
+                entry = TryTakeRecycledReadLocked(candidateSize);
+            }
+
+            entry ??= new CachedGlobalRead
+            {
+                Data = GC.AllocateUninitializedArray<byte>(candidateSize),
+            };
+            data = entry.Data;
             var readFromPvm = ctx.Memory.TryRead(baseAddress, data);
             if (readFromPvm ||
                 KernelMemoryCompatExports.TryReadTrackedLibcHeap(baseAddress, data))
@@ -702,11 +765,8 @@ internal static class Gen5ShaderScalarEvaluator
                     Interlocked.Add(ref GlobalMemoryReadLibcBytes, data.Length);
                 }
 
-                var entry = new CachedGlobalRead
-                {
-                    Data = data,
-                    LastUseSequence = VideoOut.VulkanVideoPresenter.EnqueuedGuestWorkSequence + 1,
-                };
+                entry.LastUseSequence =
+                    VideoOut.VulkanVideoPresenter.EnqueuedGuestWorkSequence + 1;
                 if (cache is not null)
                 {
                     cache[cacheKey] = entry;
@@ -714,15 +774,15 @@ internal static class Gen5ShaderScalarEvaluator
 
                 lock (_crossFrameReadGate)
                 {
-                    if (_crossFrameReadCache.TryGetValue(cacheKey, out var replaced))
+                    if (_crossFrameReadCache.Remove(cacheKey, out var replaced))
                     {
                         _crossFrameReadCacheBytes -= replaced.Data.Length;
+                        RecycleReadLocked(replaced);
                     }
 
                     if (_crossFrameReadCacheBytes + data.Length > CrossFrameReadCacheMaxBytes)
                     {
-                        _crossFrameReadCache.Clear();
-                        _crossFrameReadCacheBytes = 0;
+                        EvictCrossFrameReadCacheLocked(cache);
                     }
 
                     _crossFrameReadCache[cacheKey] = entry;
@@ -730,6 +790,11 @@ internal static class Gen5ShaderScalarEvaluator
                 }
 
                 return true;
+            }
+
+            lock (_crossFrameReadGate)
+            {
+                RecycleReadLocked(entry);
             }
 
             if (candidateSize == sizeof(uint))
