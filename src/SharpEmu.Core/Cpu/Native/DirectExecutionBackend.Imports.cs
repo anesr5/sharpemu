@@ -8,8 +8,10 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.Core.Cpu;
+using SharpEmu.Core.Cpu.Native.Windows;
 using SharpEmu.Core.Loader;
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -69,23 +71,23 @@ public sealed partial class DirectExecutionBackend
 	private unsafe static int TryRecoverUnresolvedSentinel(void* exceptionInfo)
 	{
 		EXCEPTION_RECORD* exceptionRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ExceptionRecord;
-		if (exceptionRecord->ExceptionCode != 3221225477u)
+		if (exceptionRecord->ExceptionCode != WindowsFaultCodes.AccessViolation)
 		{
 			return 0;
 		}
 		void* contextRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ContextRecord;
-		ulong value = ReadCtxU64(contextRecord, 248);
+		ulong value = ReadCtxU64(contextRecord, CTX_RIP);
 		ulong value2 = (ulong)exceptionRecord->ExceptionAddress;
 		if (!IsUnresolvedSentinel(value) && !IsUnresolvedSentinel(value2))
 		{
 			return 0;
 		}
-		ulong rsp = ReadCtxU64(contextRecord, 152);
-		WriteCtxU64(contextRecord, 120, 0uL);
+		ulong rsp = ReadCtxU64(contextRecord, CTX_RSP);
+		WriteCtxU64(contextRecord, CTX_RAX, 0uL);
 		if (TryGetPlausibleReturnFromStack(rsp, out var returnRip, out var nextRsp))
 		{
-			WriteCtxU64(contextRecord, 152, nextRsp);
-			WriteCtxU64(contextRecord, 248, returnRip);
+			WriteCtxU64(contextRecord, CTX_RSP, nextRsp);
+			WriteCtxU64(contextRecord, CTX_RIP, returnRip);
 			Interlocked.Increment(ref _rawSentinelRecoveries);
 			if (LogThreadMode)
 			{
@@ -237,6 +239,22 @@ public sealed partial class DirectExecutionBackend
 		{
 			cpuContext[CpuRegister.Rax] = 0uL;
 			return 0uL;
+		}
+		if (_hostShutdownRequested)
+		{
+			if (isGuestWorker &&
+				TryYieldGuestThreadToHostStub(argPackPtr, num, num7, importStubEntry.Nid, "host shutdown"))
+			{
+				cpuContext[CpuRegister.Rax] = 0uL;
+				return 0uL;
+			}
+
+			if (!isGuestWorker &&
+				TryAbortGuestForHostShutdown(argPackPtr, num, num7))
+			{
+				cpuContext[CpuRegister.Rax] = 1uL;
+				return 1uL;
+			}
 		}
 		bool flag0 = ShouldSuppressStrlenTrace(importStubEntry.Nid);
 		bool flag = num7 >= 2156221920u && num7 <= 2156225024u;
@@ -517,8 +535,7 @@ public sealed partial class DirectExecutionBackend
 					out var blockContinuation,
 					out var hasBlockContinuation,
 					out var blockWakeKey,
-					out var blockResumeHandler,
-					out var blockWakeHandler,
+					out var blockWaiter,
 					out var blockDeadlineTimestamp) &&
 				TryYieldGuestThreadToHostStub(argPackPtr, num, num7, importStubEntry.Nid, blockReason))
 			{
@@ -528,8 +545,7 @@ public sealed partial class DirectExecutionBackend
 						GuestThreadExecution.CurrentGuestThreadHandle,
 						blockContinuation,
 						blockWakeKey,
-						blockResumeHandler,
-						blockWakeHandler,
+						blockWaiter,
 						blockDeadlineTimestamp);
 				}
 
@@ -660,8 +676,7 @@ public sealed partial class DirectExecutionBackend
 				out var blockContinuation,
 				out var hasBlockContinuation,
 				out var blockWakeKey,
-				out var blockResumeHandler,
-				out var blockWakeHandler,
+				out var blockWaiter,
 				out var blockDeadlineTimestamp) &&
 			TryYieldGuestThreadToHostStub(argPackPtr, dispatchIndex, returnRip, importStubEntry.Nid, blockReason))
 		{
@@ -671,8 +686,7 @@ public sealed partial class DirectExecutionBackend
 					GuestThreadExecution.CurrentGuestThreadHandle,
 					blockContinuation,
 					blockWakeKey,
-					blockResumeHandler,
-					blockWakeHandler,
+					blockWaiter,
 					blockDeadlineTimestamp);
 			}
 
@@ -972,6 +986,31 @@ public sealed partial class DirectExecutionBackend
 		LastError = $"Detected repeating import loop at import#{dispatchIndex} ({nid}) and forced guest exit.";
 		Console.Error.WriteLine($"[LOADER][ERROR] Import-loop guard fired at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} -> host_exit=0x{num:X16}");
 		DumpRecentImportTrace();
+		return true;
+	}
+
+	private unsafe bool TryAbortGuestForHostShutdown(nint argPackPtr, long dispatchIndex, ulong returnRip)
+	{
+		ulong hostExit = ActiveEntryReturnSentinelRip;
+		if (hostExit < 65536 || !TryPatchActiveGuestReturnSlot(hostExit))
+		{
+			return false;
+		}
+		try
+		{
+			*(ulong*)(argPackPtr + 96) = hostExit;
+		}
+		catch
+		{
+			return false;
+		}
+		ActiveForcedGuestExit = true;
+		if (string.IsNullOrWhiteSpace(LastError))
+		{
+			LastError = "Host shutdown requested.";
+		}
+		Console.Error.WriteLine(
+			$"[LOADER][INFO] Guest unwind for host shutdown at import#{dispatchIndex} ret=0x{returnRip:X16} -> host_exit=0x{hostExit:X16}");
 		return true;
 	}
 
@@ -1684,9 +1723,9 @@ public sealed partial class DirectExecutionBackend
 		{
 			var candidateBase = ImportStubRegionCanonicalBase -
 				(ulong)candidateIndex * ImportStubRegionAddressStride;
-			if (VirtualQuery((void*)candidateBase, out var memoryInfo, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+			if (!_hostMemory.Query(candidateBase, out var memoryInfo) ||
 				memoryInfo.RegionSize == 0 ||
-				memoryInfo.State != 4096)
+				memoryInfo.State != HostRegionState.Committed)
 			{
 				continue;
 			}
@@ -1927,23 +1966,36 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 
-		List<byte> list = new List<byte>(Math.Min(maxLength, 256));
-		Span<byte> destination = stackalloc byte[1];
-		for (int i = 0; i < maxLength; i++)
+		// Reads stay byte-by-byte through TryReadByteCompat (its Marshal.ReadByte
+		// fallback must probe exactly up to the terminator), but the bytes land in a
+		// stack buffer instead of a List<byte> + ToArray per symbol resolution.
+		const int StackBufferLength = 512;
+		byte[]? rented = maxLength > StackBufferLength ? System.Buffers.ArrayPool<byte>.Shared.Rent(maxLength) : null;
+		Span<byte> buffer = rented is null ? stackalloc byte[StackBufferLength] : rented;
+		try
 		{
-			if (!TryReadByteCompat(address + (ulong)i, destination))
+			for (int i = 0; i < maxLength; i++)
 			{
-				return false;
+				if (!TryReadByteCompat(address + (ulong)i, buffer.Slice(i, 1)))
+				{
+					return false;
+				}
+				if (buffer[i] == 0)
+				{
+					value = System.Text.Encoding.ASCII.GetString(buffer[..i]);
+					return true;
+				}
 			}
-			if (destination[0] == 0)
-			{
-				value = System.Text.Encoding.ASCII.GetString(list.ToArray());
-				return true;
-			}
-			list.Add(destination[0]);
+			value = System.Text.Encoding.ASCII.GetString(buffer[..maxLength]);
+			return true;
 		}
-		value = System.Text.Encoding.ASCII.GetString(list.ToArray());
-		return true;
+		finally
+		{
+			if (rented is not null)
+			{
+				System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+			}
+		}
 	}
 
 	private bool TryReadByteCompat(ulong address, Span<byte> destination)
@@ -2025,7 +2077,7 @@ public sealed partial class DirectExecutionBackend
 		uint flNewProtect = default(uint);
 		try
 		{
-			if (Marshal.ReadByte(num2) != 232 || !VirtualProtect((void*)num, 5u, 64u, &flNewProtect))
+			if (Marshal.ReadByte(num2) != 232 || !_hostMemory.Protect((ulong)(void*)num, 5u, HostPageProtection.ReadWriteExecute, out flNewProtect))
 			{
 				return;
 			}
@@ -2033,7 +2085,7 @@ public sealed partial class DirectExecutionBackend
 			{
 				Marshal.WriteByte(num2 + i, 144);
 			}
-			FlushInstructionCache(GetCurrentProcess(), (void*)num, 5u);
+			_hostMemory.FlushInstructionCache((ulong)(void*)num, 5u);
 			_patchedEa020eLookupCall = true;
 			Console.Error.WriteLine($"[LOADER][WARNING] Import#{dispatchIndex}: patched hash-lookup call at 0x{num:X16} -> NOP*5");
 		}
@@ -2044,7 +2096,7 @@ public sealed partial class DirectExecutionBackend
 		{
 			if (flNewProtect != 0)
 			{
-				VirtualProtect((void*)num, 5u, flNewProtect, &flNewProtect);
+				_hostMemory.ProtectRaw((ulong)(void*)num, 5u, flNewProtect, out flNewProtect);
 			}
 		}
 	}

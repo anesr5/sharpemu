@@ -12,7 +12,8 @@ using Avalonia.Platform;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
-using SharpEmu.Libs.Pad;
+using SharpEmu.HLE.Host;
+using SharpEmu.HLE.Host.Windows;
 using SharpEmu.Logging;
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
@@ -62,7 +63,7 @@ public partial class MainWindow : Window
 
     // Controller navigation state.
     private readonly DispatcherTimer _gamepadTimer;
-    private uint _previousPadButtons;
+    private HostGamepadButtons _previousPadButtons;
     private long _navLeftNextAt;
     private long _navRightNextAt;
     private long _navUpNextAt;
@@ -125,6 +126,18 @@ public partial class MainWindow : Window
             UpdateDiscordPresence();
         };
         SelectLogFilePathButton.Click += async (_, _) => await SelectLogFilePathAsync();
+        EnvBthidToggle.IsCheckedChanged += (_, _) =>
+            SetEnvironmentToggle("SHARPEMU_BTHID_UNAVAILABLE", EnvBthidToggle.IsChecked == true);
+        EnvLoopGuardToggle.IsCheckedChanged += (_, _) =>
+            SetEnvironmentToggle("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD", EnvLoopGuardToggle.IsChecked == true);
+        EnvVkValidationToggle.IsCheckedChanged += (_, _) =>
+            SetEnvironmentToggle("SHARPEMU_VK_VALIDATION", EnvVkValidationToggle.IsChecked == true);
+        EnvDumpSpirvToggle.IsCheckedChanged += (_, _) =>
+            SetEnvironmentToggle("SHARPEMU_DUMP_SPIRV", EnvDumpSpirvToggle.IsChecked == true);
+        EnvLogDirectMemoryToggle.IsCheckedChanged += (_, _) =>
+            SetEnvironmentToggle("SHARPEMU_LOG_DIRECT_MEMORY", EnvLogDirectMemoryToggle.IsChecked == true);
+        EnvLogNpToggle.IsCheckedChanged += (_, _) =>
+            SetEnvironmentToggle("SHARPEMU_LOG_NP", EnvLogNpToggle.IsChecked == true);
         LanguageBox.SelectionChanged += (_, _) => OnLanguageChanged();
 
         GameList.AddHandler(ContextRequestedEvent, OnGameContextRequested, RoutingStrategies.Tunnel);
@@ -139,14 +152,33 @@ public partial class MainWindow : Window
         Opened += async (_, _) => await OnOpenedAsync();
         Closing += (_, _) => OnWindowClosing();
 
-        DualSenseReader.EnsureStarted();
-        XInputReader.EnsureStarted();
+        WindowsDualSenseReader.EnsureStarted();
+        WindowsXInputReader.EnsureStarted();
         _gamepadTimer = new DispatcherTimer
         {
             Interval = TimeSpan.FromMilliseconds(50),
         };
         _gamepadTimer.Tick += (_, _) => PollGamepad();
         _gamepadTimer.Start();
+
+
+        GithubButton.Click += (_, _) =>
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "https://github.com/par274/sharpemu",
+                UseShellExecute = true
+            });
+        };
+
+        DiscordButton.Click += (_, _) =>
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "https://discord.com/invite/6GejPEDqpc",
+                UseShellExecute = true
+            });
+        };
     }
 
     /// <summary>
@@ -193,9 +225,9 @@ public partial class MainWindow : Window
     private void PollGamepad()
     {
         // DualSense wins when both are connected; XInput covers Xbox pads.
-        if (!DualSenseReader.TryGetState(out var pad) && !XInputReader.TryGetState(out pad))
+        if (!WindowsDualSenseReader.TryGetState(out var pad) && !WindowsXInputReader.TryGetState(out pad))
         {
-            _previousPadButtons = 0;
+            _previousPadButtons = HostGamepadButtons.None;
             return;
         }
 
@@ -208,12 +240,12 @@ public partial class MainWindow : Window
         }
 
         var shoulderPressed = pad.Buttons & ~_previousPadButtons;
-        if ((shoulderPressed & OrbisPadButton.L1) != 0)
+        if ((shoulderPressed & HostGamepadButtons.L1) != 0)
         {
             SetActivePage(0);
         }
 
-        if ((shoulderPressed & OrbisPadButton.R1) != 0)
+        if ((shoulderPressed & HostGamepadButtons.R1) != 0)
         {
             SetActivePage(1);
         }
@@ -225,10 +257,10 @@ public partial class MainWindow : Window
         }
 
         var now = Environment.TickCount64;
-        var left = (pad.Buttons & 0x0080) != 0 || pad.LeftX < 64;
-        var right = (pad.Buttons & 0x0020) != 0 || pad.LeftX > 192;
-        var up = (pad.Buttons & 0x0010) != 0 || pad.LeftY < 64;
-        var down = (pad.Buttons & 0x0040) != 0 || pad.LeftY > 192;
+        var left = (pad.Buttons & HostGamepadButtons.Left) != 0 || pad.LeftX < 64;
+        var right = (pad.Buttons & HostGamepadButtons.Right) != 0 || pad.LeftX > 192;
+        var up = (pad.Buttons & HostGamepadButtons.Up) != 0 || pad.LeftY < 64;
+        var down = (pad.Buttons & HostGamepadButtons.Down) != 0 || pad.LeftY > 192;
 
         if (ShouldNavigate(left, ref _navLeftNextAt, now))
         {
@@ -251,12 +283,12 @@ public partial class MainWindow : Window
         }
 
         var pressed = pad.Buttons & ~_previousPadButtons;
-        if ((pressed & 0x4000) != 0) // Cross
+        if ((pressed & HostGamepadButtons.Cross) != 0)
         {
             LaunchSelected();
         }
 
-        if ((pressed & 0x2000) != 0) // Circle
+        if ((pressed & HostGamepadButtons.Circle) != 0)
         {
             StopEmulator();
         }
@@ -384,6 +416,15 @@ public partial class MainWindow : Window
         LoadingStateText.Text = loc.Get("Library.Loading");
 
         GeneralTabItem.Header = loc.Get("Options.General");
+        EnvTabItem.Header = loc.Get("Options.Env.Tab");
+        EnvSectionTitle.Text = loc.Get("Options.Section.Environment");
+        EnvDesc.Text = loc.Get("Options.Env.Desc");
+        EnvBthidDesc.Text = loc.Get("Options.Env.Bthid.Desc");
+        EnvLoopGuardDesc.Text = loc.Get("Options.Env.LoopGuard.Desc");
+        EnvVkValidationDesc.Text = loc.Get("Options.Env.VkValidation.Desc");
+        EnvDumpSpirvDesc.Text = loc.Get("Options.Env.DumpSpirv.Desc");
+        EnvLogDirectMemoryDesc.Text = loc.Get("Options.Env.LogDirectMemory.Desc");
+        EnvLogNpDesc.Text = loc.Get("Options.Env.LogNp.Desc");
         EmulationSectionTitle.Text = loc.Get("Options.Section.Emulation");
         LoggingSectionTitle.Text = loc.Get("Options.Section.Logging");
         LauncherSectionTitle.Text = loc.Get("Options.Section.Launcher");
@@ -442,6 +483,14 @@ public partial class MainWindow : Window
         ConsoleToggle.Content = loc.Get("Launch.Console");
         LaunchButton.Content = loc.Get("Launch.Launch");
         StopButton.Content = loc.Get("Launch.Stop");
+
+        AboutSectionTitle.Text = loc.Get("Options.About");
+        GithubLabel.Text = loc.Get("About.Github.Label");
+        GithubDesc.Text = loc.Get("About.Github.Desc");
+        DiscordServerLabel.Text = loc.Get("About.Discord.Label");
+        DiscordServerDesc.Text = loc.Get("About.Discord.Desc");
+        GithubButton.Content = loc.Get("About.GithubButton");
+        DiscordButton.Content = loc.Get("About.DiscordButton");
 
         UpdateEmptyStateTexts();
         UpdateSelectedGameTexts();
@@ -557,7 +606,32 @@ public partial class MainWindow : Window
         OverrideLogFileToggle.IsChecked = _settings.OverrideLogFile;
         TitleMusicToggle.IsChecked = _settings.PlayTitleMusic;
         DiscordToggle.IsChecked = _settings.DiscordRichPresence;
+        EnvBthidToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_BTHID_UNAVAILABLE");
+        EnvLoopGuardToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD");
+        EnvVkValidationToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_VK_VALIDATION");
+        EnvDumpSpirvToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_DUMP_SPIRV");
+        EnvLogDirectMemoryToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_LOG_DIRECT_MEMORY");
+        EnvLogNpToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_LOG_NP");
         UpdateLogFilePathText();
+    }
+
+    // Environment variables set on this process at the previous launch; children
+    // inherit the process environment, so stale names must be cleared explicitly.
+    private readonly HashSet<string> _appliedEnvironmentVariables = new(StringComparer.OrdinalIgnoreCase);
+
+    private void SetEnvironmentToggle(string name, bool enabled)
+    {
+        if (enabled)
+        {
+            if (!_settings.EnvironmentToggles.Contains(name))
+            {
+                _settings.EnvironmentToggles.Add(name);
+            }
+        }
+        else
+        {
+            _settings.EnvironmentToggles.Remove(name);
+        }
     }
 
     private string SelectedLogLevel()
@@ -1375,6 +1449,24 @@ public partial class MainWindow : Window
             Localization.Instance.Format("Launch.Command", string.Join(' ', arguments)),
             DimLineBrush);
 
+        // Apply the enabled switches to this process; both emulator launch paths
+        // (CreateProcessW and Process.Start) inherit it. Clear switches turned
+        // off since the previous launch.
+        foreach (var staleName in _appliedEnvironmentVariables)
+        {
+            if (!_settings.EnvironmentToggles.Contains(staleName))
+            {
+                Environment.SetEnvironmentVariable(staleName, null);
+            }
+        }
+
+        _appliedEnvironmentVariables.Clear();
+        foreach (var name in _settings.EnvironmentToggles)
+        {
+            Environment.SetEnvironmentVariable(name, "1");
+            _appliedEnvironmentVariables.Add(name);
+        }
+
         var emulator = new EmulatorProcess();
         emulator.OutputReceived += (line, isError) => _pendingLines.Enqueue((line, isError));
         emulator.Exited += code => Dispatcher.UIThread.Post(() => OnEmulatorExited(code));
@@ -1472,6 +1564,7 @@ public partial class MainWindow : Window
             2 => "Exit.EbootNotFound",
             3 => "Exit.RuntimeException",
             4 => "Exit.EmulationError",
+            -1073741819 => "Exit.EmulationError",
             _ => "Exit.Unknown",
         };
         var meaning = Localization.Instance.Get(meaningKey);

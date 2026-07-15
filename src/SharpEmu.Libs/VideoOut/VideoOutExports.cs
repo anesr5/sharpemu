@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
+using SharpEmu.Libs.Audio;
 using SharpEmu.Libs.Kernel;
 using SharpEmu.Logging;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -52,6 +55,8 @@ public static class VideoOutExports
     private const int VblankWaitTimeoutMilliseconds = 100;
     private static Thread? _vblankPumpThread;
     private static int _vblankPumpStarted;
+    private static volatile int _vblankPumpStopRequested;
+    private static volatile int _presentationWindowCloseNotified;
 
     private static readonly object _vblankEdgeGate = new();
     private static ulong _vblankEdgeSequence;
@@ -64,7 +69,7 @@ public static class VideoOutExports
             return;
         }
 
-        HostTimerResolution.Request();
+        HostPlatform.Current.Threading.RequestTimerResolution();
 
         _vblankPumpThread = new Thread(VblankPumpLoop)
         {
@@ -80,7 +85,7 @@ public static class VideoOutExports
         var intervalTicks = Math.Max(1L, (long)(Stopwatch.Frequency / VblankHz));
         var nextEdge = Stopwatch.GetTimestamp() + intervalTicks;
 
-        while (true)
+        while (_vblankPumpStopRequested == 0)
         {
             WaitUntilTimestamp(nextEdge);
             PumpVblanks();
@@ -94,6 +99,59 @@ public static class VideoOutExports
                 Interlocked.Add(ref _vblankMissedEdges, missed);
                 nextEdge = now + intervalTicks;
             }
+        }
+    }
+
+    public static void NotifyPresentationWindowClosed()
+    {
+        if (Interlocked.Exchange(ref _presentationWindowCloseNotified, 1) != 0)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine("[LOADER][INFO] VideoOut presentation window closed");
+        RequestHostShutdown("videoout-window-closed");
+    }
+
+    public static void NotifyHostInterrupt()
+    {
+        if (Interlocked.Exchange(ref _presentationWindowCloseNotified, 1) != 0)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine("[LOADER][INFO] Host interrupt requested");
+        RequestHostShutdown("host-interrupt");
+    }
+
+    private static void RequestHostShutdown(string reason)
+    {
+        AudioOutExports.ShutdownAllPorts();
+        StopVblankPump();
+        HostSessionControl.RequestShutdown(reason);
+        ScheduleProcessExitIfGuestDoesNotStop();
+    }
+
+    private static void ScheduleProcessExitIfGuestDoesNotStop()
+    {
+        ThreadPool.QueueUserWorkItem(static _ =>
+        {
+            Thread.Sleep(2000);
+            Environment.Exit(0);
+        });
+    }
+
+    public static void StopVblankPump()
+    {
+        if (Interlocked.Exchange(ref _vblankPumpStopRequested, 1) != 0)
+        {
+            return;
+        }
+
+        var thread = _vblankPumpThread;
+        if (thread is { IsAlive: true })
+        {
+            thread.Join(TimeSpan.FromSeconds(2));
         }
     }
 
@@ -124,6 +182,10 @@ public static class VideoOutExports
         }
     }
 
+    // Only ever touched by the vblank pump thread; reused across edges so the 60 Hz
+    // pump does not allocate a fresh snapshot per edge.
+    private static readonly List<VideoOutPortState> _vblankPumpPorts = new();
+
     private static void PumpVblanks()
     {
         lock (_vblankEdgeGate)
@@ -132,7 +194,7 @@ public static class VideoOutExports
             Monitor.PulseAll(_vblankEdgeGate);
         }
 
-        VideoOutPortState[] ports;
+        _vblankPumpPorts.Clear();
         lock (_stateGate)
         {
             if (_ports.Count == 0)
@@ -142,10 +204,16 @@ public static class VideoOutExports
 
             // Signalling reaches WakeBlockedThreads -> Pump(), which serialises on one global
             // flag. Waking an unwatched queue would hold it 60x/sec and starve guest threads.
-            ports = _ports.Values.Where(static port => port.VblankEvents.Count != 0).ToArray();
+            foreach (var port in _ports.Values)
+            {
+                if (port.VblankEvents.Count != 0)
+                {
+                    _vblankPumpPorts.Add(port);
+                }
+            }
         }
 
-        foreach (var port in ports)
+        foreach (var port in _vblankPumpPorts)
         {
             SignalVblank(port);
         }
@@ -163,6 +231,12 @@ public static class VideoOutExports
         StringComparison.Ordinal);
     private static readonly bool _logVideoOutSync = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT_SYNC"),
+        "1",
+        StringComparison.Ordinal);
+    // Call sites must check this before building the interpolated message; the trace
+    // strings would otherwise be allocated on the per-frame flip path even with tracing off.
+    private static readonly bool _logVideoOut = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT"),
         "1",
         StringComparison.Ordinal);
     private static readonly bool _dumpVideoOut = string.Equals(
@@ -348,6 +422,34 @@ public static class VideoOutExports
     }
 
     [SysAbiExport(
+        Nid = "+I4K03i3EL0",
+        ExportName = "sceVideoOutInitializeOutputOptions",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutInitializeOutputOptions(CpuContext ctx)
+    {
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "w0hLuNarQxY",
+        ExportName = "sceVideoOutConfigureOutput",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutConfigureOutput(CpuContext ctx)
+    {
+        // Accept the requested output configuration; the presenter always renders
+        // at the display buffer's native size.
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        if (!TryGetPort(handle, out _))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "utPrVdxio-8",
         ExportName = "sceVideoOutGetOutputStatus",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -502,7 +604,10 @@ public static class VideoOutExports
         // Some engines wait on this queue before issuing their first flip. Provide a first
         // edge now; later calls to WaitVblank advance the same notification sequence.
         SignalVblank(port);
-        TraceVideoOut($"videoout.add_vblank_event eq=0x{equeue:X16} handle={handle} udata=0x{userData:X16}");
+        if (_logVideoOut)
+        {
+            TraceVideoOut($"videoout.add_vblank_event eq=0x{equeue:X16} handle={handle} udata=0x{userData:X16}");
+        }
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -539,7 +644,10 @@ public static class VideoOutExports
             }
         }
 
-        TraceVideoOut($"videoout.add_flip_event eq=0x{equeue:X16} handle={handle} udata=0x{userData:X16}");
+        if (_logVideoOut)
+        {
+            TraceVideoOut($"videoout.add_flip_event eq=0x{equeue:X16} handle={handle} udata=0x{userData:X16}");
+        }
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -600,7 +708,10 @@ public static class VideoOutExports
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, unchecked((ulong)flipArg));
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x20, currentBuffer);
 
-        TraceVideoOut($"videoout.get_flip_status handle={handle} count={count} currentBuffer={currentBuffer}");
+        if (_logVideoOut)
+        {
+            TraceVideoOut($"videoout.get_flip_status handle={handle} count={count} currentBuffer={currentBuffer}");
+        }
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -993,33 +1104,53 @@ public static class VideoOutExports
 
     private static void SignalVblank(VideoOutPortState port)
     {
-        List<FlipEventRegistration> vblankEvents;
+        // Snapshot the registrations into a pooled rental so the triggers can run outside
+        // _stateGate without copying the list into a fresh allocation on every edge.
+        // A per-port reusable buffer would race: the pump thread and a guest thread's
+        // first-edge signal (AddVblankEvent) can signal the same port concurrently.
+        FlipEventRegistration[]? vblankEvents = null;
+        int vblankEventCount;
         ulong eventHint;
         lock (_stateGate)
         {
             port.VblankCount++;
             eventHint = SceVideoOutInternalEventVblank |
                 ((port.VblankCount & 0x0000_FFFF_FFFF_FFFFUL) << 16);
-            vblankEvents = new List<FlipEventRegistration>(port.VblankEvents);
+            vblankEventCount = port.VblankEvents.Count;
+            if (vblankEventCount != 0)
+            {
+                vblankEvents = ArrayPool<FlipEventRegistration>.Shared.Rent(vblankEventCount);
+                port.VblankEvents.CopyTo(vblankEvents);
+            }
         }
 
         var signalCount = Interlocked.Increment(ref _vblankSignalCount);
 
-        foreach (var vblankEvent in vblankEvents)
+        if (vblankEvents is not null)
         {
-            _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
-                vblankEvent.Equeue,
-                SceVideoOutInternalEventVblank,
-                OrbisKernelEventFilterVideoOut,
-                eventHint,
-                vblankEvent.UserData);
+            try
+            {
+                for (var i = 0; i < vblankEventCount; i++)
+                {
+                    _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
+                        vblankEvents[i].Equeue,
+                        SceVideoOutInternalEventVblank,
+                        OrbisKernelEventFilterVideoOut,
+                        eventHint,
+                        vblankEvents[i].UserData);
+                }
+            }
+            finally
+            {
+                ArrayPool<FlipEventRegistration>.Shared.Return(vblankEvents);
+            }
         }
 
         if (_logVideoOutSync && (signalCount <= 8 || signalCount % 60 == 0))
         {
             Console.Error.WriteLine(
                 $"[LOADER][SYNC] vblank#{signalCount} handle={port.Handle} count={port.VblankCount} " +
-                $"queues={vblankEvents.Count} hint=0x{eventHint:X16}");
+                $"queues={vblankEventCount} hint=0x{eventHint:X16}");
         }
     }
 
@@ -1041,8 +1172,11 @@ public static class VideoOutExports
             return OrbisVideoOutErrorInvalidIndex;
         }
 
+        // Pooled snapshot for the same reason as SignalVblank: triggers run outside
+        // _stateGate, and SubmitFlip is per-frame so a fresh List copy is steady churn.
         ulong eventHint;
-        List<FlipEventRegistration> flipEvents;
+        FlipEventRegistration[]? flipEvents = null;
+        int flipEventCount;
         lock (_stateGate)
         {
             if (bufferIndex != -1 && port.BufferSlots[bufferIndex].GroupIndex < 0)
@@ -1054,7 +1188,12 @@ public static class VideoOutExports
             port.FlipCount++;
             eventHint = SceVideoOutInternalEventFlip |
                 ((unchecked((ulong)flipArg) & 0x0000_FFFF_FFFF_FFFFUL) << 16);
-            flipEvents = new List<FlipEventRegistration>(port.FlipEvents);
+            flipEventCount = port.FlipEvents.Count;
+            if (flipEventCount != 0)
+            {
+                flipEvents = ArrayPool<FlipEventRegistration>.Shared.Rent(flipEventCount);
+                port.FlipEvents.CopyTo(flipEvents);
+            }
         }
 
         var guestImageSubmitted = false;
@@ -1076,14 +1215,24 @@ public static class VideoOutExports
             _ = TryDumpFrame(ctx, port, bufferIndex, flipMode, flipArg);
         }
 
-        foreach (var flipEvent in flipEvents)
+        if (flipEvents is not null)
         {
-            _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
-                flipEvent.Equeue,
-                SceVideoOutInternalEventFlip,
-                OrbisKernelEventFilterVideoOut,
-                eventHint,
-                flipEvent.UserData);
+            try
+            {
+                for (var i = 0; i < flipEventCount; i++)
+                {
+                    _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
+                        flipEvents[i].Equeue,
+                        SceVideoOutInternalEventFlip,
+                        OrbisKernelEventFilterVideoOut,
+                        eventHint,
+                        flipEvents[i].UserData);
+                }
+            }
+            finally
+            {
+                ArrayPool<FlipEventRegistration>.Shared.Return(flipEvents);
+            }
         }
 
         var flipCount = Interlocked.Increment(ref _flipSubmitCount);
@@ -1092,10 +1241,13 @@ public static class VideoOutExports
             Console.Error.WriteLine(
                 $"[LOADER][SYNC] flip#{flipCount} handle={handle} buffer={bufferIndex} " +
                 $"addr=0x{guestImageAddress:X16} submitted={guestImageSubmitted} " +
-                $"flipQueues={flipEvents.Count}");
+                $"flipQueues={flipEventCount}");
         }
 
-        TraceVideoOut($"videoout.submit_flip handle={handle} index={bufferIndex} mode={flipMode} arg={flipArg} events={flipEvents.Count}");
+        if (_logVideoOut)
+        {
+            TraceVideoOut($"videoout.submit_flip handle={handle} index={bufferIndex} mode={flipMode} arg={flipArg} events={flipEventCount}");
+        }
         ReportFrameRate(presented: false);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1177,8 +1329,11 @@ public static class VideoOutExports
                 slot.AddressRight = 0;
             }
 
-            TraceVideoOut(
-                $"videoout.register_buffers handle={port.Handle} group={groupIndex} start={startIndex} count={addresses.Length} fmt=0x{attribute.PixelFormat:X} tile={attribute.TilingMode} {attribute.Width}x{attribute.Height} pitch={attribute.PitchInPixel}");
+            if (_logVideoOut)
+            {
+                TraceVideoOut(
+                    $"videoout.register_buffers handle={port.Handle} group={groupIndex} start={startIndex} count={addresses.Length} fmt=0x{attribute.PixelFormat:X} tile={attribute.TilingMode} {attribute.Width}x{attribute.Height} pitch={attribute.PitchInPixel}");
+            }
             VulkanVideoPresenter.EnsureStarted(attribute.Width, attribute.Height);
 
             var guestFormat = MapPixelFormatToGuestTextureFormat(attribute.PixelFormat);
@@ -1344,7 +1499,10 @@ public static class VideoOutExports
         var basePath = GetFrameDumpBasePath(frameIndex, port.Handle, bufferIndex);
         WriteBmp(basePath + ".bmp", attribute.Width, attribute.Height, rgb);
         WriteFrameMetadata(basePath + ".txt", slot.AddressLeft, attribute, bufferIndex, flipMode, flipArg, "bmp-linear-read", fingerprint);
-        TraceVideoOut($"videoout.dump_frame path={basePath}.bmp addr=0x{slot.AddressLeft:X16} {attribute.Width}x{attribute.Height} fmt=0x{attribute.PixelFormat:X} fingerprint=0x{fingerprint:X16}");
+        if (_logVideoOut)
+        {
+            TraceVideoOut($"videoout.dump_frame path={basePath}.bmp addr=0x{slot.AddressLeft:X16} {attribute.Width}x{attribute.Height} fmt=0x{attribute.PixelFormat:X} fingerprint=0x{fingerprint:X16}");
+        }
         return true;
     }
 
@@ -1383,7 +1541,10 @@ public static class VideoOutExports
         var basePath = GetFrameDumpBasePath(frameIndex, handle, bufferIndex);
         File.WriteAllBytes(basePath + ".raw", bytes);
         WriteFrameMetadata(basePath + ".txt", address, attribute, bufferIndex, flipMode, flipArg, reason, fingerprint);
-        TraceVideoOut($"videoout.dump_frame path={basePath}.raw addr=0x{address:X16} bytes={byteCount} reason={reason} fingerprint=0x{fingerprint:X16}");
+        if (_logVideoOut)
+        {
+            TraceVideoOut($"videoout.dump_frame path={basePath}.raw addr=0x{address:X16} bytes={byteCount} reason={reason} fingerprint=0x{fingerprint:X16}");
+        }
         return true;
     }
 
@@ -1610,11 +1771,6 @@ public static class VideoOutExports
 
     private static void TraceVideoOut(string message)
     {
-        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT"), "1", StringComparison.Ordinal))
-        {
-            return;
-        }
-
         Console.Error.WriteLine($"[LOADER][TRACE] {message}");
     }
 }

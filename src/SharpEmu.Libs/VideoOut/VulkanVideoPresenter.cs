@@ -4,7 +4,9 @@
 using Silk.NET.Core;
 using Silk.NET.Core.Native;
 using Silk.NET.Maths;
+using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
+using Silk.NET.Input;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Vulkan.Extensions.EXT;
@@ -104,14 +106,17 @@ internal readonly record struct VulkanGuestBlendState(
 }
 
 internal sealed record VulkanGuestRenderState(
-    VulkanGuestBlendState Blend,
+    IReadOnlyList<VulkanGuestBlendState> Blends,
     VulkanGuestRect? Scissor,
     VulkanGuestViewport? Viewport)
 {
     public static VulkanGuestRenderState Default { get; } = new(
-        VulkanGuestBlendState.Default,
+        [VulkanGuestBlendState.Default],
         Scissor: null,
         Viewport: null);
+
+    public VulkanGuestBlendState Blend =>
+        Blends.Count == 0 ? VulkanGuestBlendState.Default : Blends[0];
 }
 
 internal sealed record VulkanGuestRenderTarget(
@@ -121,6 +126,13 @@ internal sealed record VulkanGuestRenderTarget(
     uint Format,
     uint NumberType,
     uint MipLevels = 1);
+
+internal readonly record struct VulkanRenderTargetFormat(
+    Format Format,
+    Gen5PixelOutputKind OutputKind)
+{
+    public bool IsInteger => OutputKind is Gen5PixelOutputKind.Uint or Gen5PixelOutputKind.Sint;
+}
 
 internal sealed record VulkanTranslatedGuestDraw(
     byte[] VertexSpirv,
@@ -137,7 +149,7 @@ internal sealed record VulkanTranslatedGuestDraw(
 
 internal sealed record VulkanOffscreenGuestDraw(
     VulkanTranslatedGuestDraw Draw,
-    VulkanGuestRenderTarget Target,
+    IReadOnlyList<VulkanGuestRenderTarget> Targets,
     bool PublishTarget);
 
 internal sealed record VulkanComputeGuestDispatch(
@@ -154,7 +166,10 @@ internal static unsafe class VulkanVideoPresenter
     private const uint DefaultWindowWidth = 1280;
     private const uint DefaultWindowHeight = 720;
     private const int MaxPendingGuestWork = 16;
-    private const int MaxGuestWorkPerRender = 16;
+    // A single guest frame commonly contains 30-50 translated draws.  Limiting
+    // this to 16 split one frame across several 60 Hz window callbacks and
+    // unnecessarily throttled the producer behind the bounded work queue.
+    private const int MaxGuestWorkPerRender = 128;
     private const uint GuestPrimitiveRectList = 0x11;
     private const uint GuestFormatR32Uint = 0x10004;
     private const uint GuestFormatR32Sint = 0x20004;
@@ -179,8 +194,11 @@ internal static unsafe class VulkanVideoPresenter
     private static uint _windowWidth;
     private static uint _windowHeight;
     private static bool _closed;
+    private static bool _presenterCloseRequested;
     private const string DebugUtilsExtensionName = "VK_EXT_debug_utils";
     private const uint NvidiaVendorId = 0x10DE;
+    private const string PortabilityEnumerationExtensionName = "VK_KHR_portability_enumeration";
+    private const string PortabilitySubsetExtensionName = "VK_KHR_portability_subset";
     private static bool _splashHidden;
     private static long _enqueuedGuestWorkSequence;
     private static long _completedGuestWorkSequence;
@@ -190,6 +208,29 @@ internal static unsafe class VulkanVideoPresenter
         var mode = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGES");
         return string.Equals(mode, "1", StringComparison.Ordinal) ||
                string.Equals(mode, "present", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldTraceGuestImageSubmissionsForDiagnostics()
+    {
+        return string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGES"),
+            "1",
+            StringComparison.Ordinal);
+    }
+
+    private static bool ShouldSamplePresentedGuestImageForDiagnostics(long frame)
+    {
+        var mode = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGES");
+        if (string.Equals(mode, "present", StringComparison.OrdinalIgnoreCase))
+        {
+            // A 4K Vulkan readback is deliberately synchronous and can take
+            // several seconds on Linux.  The lightweight "present" mode only
+            // needs one proof that the final image is non-black.
+            return frame == 1;
+        }
+
+        return string.Equals(mode, "1", StringComparison.Ordinal) &&
+               (frame is 1 or 30 or 120 || frame % 600 == 0);
     }
 
     public static void EnsureStarted(uint width, uint height)
@@ -249,12 +290,7 @@ internal static unsafe class VulkanVideoPresenter
                     TranslatedDraw: null,
                     RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                     IsSplash: false);
-            _thread = new Thread(Run)
-            {
-                IsBackground = true,
-                Name = "SharpEmu Vulkan VideoOut",
-            };
-            _thread.Start();
+            StartPresenterLocked();
         }
     }
 
@@ -290,7 +326,7 @@ internal static unsafe class VulkanVideoPresenter
             return;
         }
 
-        if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+        if (ShouldTraceGuestImageSubmissionsForDiagnostics())
         {
             Console.Error.WriteLine($"[LOADER][TRACE] vk.submit_call kind=Submit {width}x{height}");
         }
@@ -320,12 +356,7 @@ internal static unsafe class VulkanVideoPresenter
 
             _windowWidth = width;
             _windowHeight = height;
-            _thread = new Thread(Run)
-            {
-                IsBackground = true,
-                Name = "SharpEmu Vulkan VideoOut",
-            };
-            _thread.Start();
+            StartPresenterLocked();
         }
     }
 
@@ -336,7 +367,7 @@ internal static unsafe class VulkanVideoPresenter
             return;
         }
 
-        if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+        if (ShouldTraceGuestImageSubmissionsForDiagnostics())
         {
             Console.Error.WriteLine($"[LOADER][TRACE] vk.submit_call kind=SubmitGuestDraw({drawKind}) {width}x{height}");
         }
@@ -370,12 +401,7 @@ internal static unsafe class VulkanVideoPresenter
 
             _windowWidth = width;
             _windowHeight = height;
-            _thread = new Thread(Run)
-            {
-                IsBackground = true,
-                Name = "SharpEmu Vulkan VideoOut",
-            };
-            _thread.Start();
+            StartPresenterLocked();
         }
     }
 
@@ -399,7 +425,7 @@ internal static unsafe class VulkanVideoPresenter
             return;
         }
 
-        if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+        if (ShouldTraceGuestImageSubmissionsForDiagnostics())
         {
             Console.Error.WriteLine(
                 $"[LOADER][TRACE] vk.submit_call kind=SubmitTranslatedDraw {width}x{height} textures={textures.Count}");
@@ -441,12 +467,7 @@ internal static unsafe class VulkanVideoPresenter
 
             _windowWidth = width;
             _windowHeight = height;
-            _thread = new Thread(Run)
-            {
-                IsBackground = true,
-                Name = "SharpEmu Vulkan VideoOut",
-            };
-            _thread.Start();
+            StartPresenterLocked();
         }
     }
 
@@ -464,19 +485,69 @@ internal static unsafe class VulkanVideoPresenter
         IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
         VulkanGuestRenderState? renderState = null)
     {
+        SubmitOffscreenTranslatedDraw(
+            pixelSpirv,
+            textures,
+            globalMemoryBuffers,
+            attributeCount,
+            [target],
+            vertexSpirv,
+            vertexCount,
+            instanceCount,
+            primitiveType,
+            indexBuffer,
+            vertexBuffers,
+            renderState);
+    }
+
+    public static void SubmitOffscreenTranslatedDraw(
+        byte[] pixelSpirv,
+        IReadOnlyList<VulkanGuestDrawTexture> textures,
+        IReadOnlyList<VulkanGuestMemoryBuffer> globalMemoryBuffers,
+        uint attributeCount,
+        IReadOnlyList<VulkanGuestRenderTarget> targets,
+        byte[]? vertexSpirv = null,
+        uint vertexCount = 3,
+        uint instanceCount = 1,
+        uint primitiveType = 4,
+        VulkanGuestIndexBuffer? indexBuffer = null,
+        IReadOnlyList<VulkanGuestVertexBuffer>? vertexBuffers = null,
+        VulkanGuestRenderState? renderState = null)
+    {
         if (pixelSpirv.Length == 0 ||
-            target.Address == 0 ||
-            target.Width == 0 ||
-            target.Height == 0)
+            targets.Count == 0 ||
+            targets.Count > 8 ||
+            targets.Any(target =>
+                target.Address == 0 || target.Width == 0 || target.Height == 0))
         {
             return;
         }
 
-        if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+        var firstTarget = targets[0];
+        if (targets.Any(target =>
+                target.Width != firstTarget.Width || target.Height != firstTarget.Height) ||
+            targets.Select(target => target.Address).Distinct().Count() != targets.Count)
+        {
+            Console.Error.WriteLine(
+                "[LOADER][WARN] Vulkan skipped MRT draw with mismatched dimensions or aliased targets.");
+            return;
+        }
+
+        if (ShouldTraceGuestImageSubmissionsForDiagnostics())
         {
             Console.Error.WriteLine(
                 $"[LOADER][TRACE] vk.submit_call kind=SubmitOffscreenTranslatedDraw " +
-                $"target=0x{target.Address:X16} {target.Width}x{target.Height} textures={textures.Count}");
+                $"targets={targets.Count} first=0x{firstTarget.Address:X16} " +
+                $"{firstTarget.Width}x{firstTarget.Height} textures={textures.Count}");
+        }
+
+        var effectiveRenderState = renderState ?? VulkanGuestRenderState.Default;
+        if (effectiveRenderState.Blends.Count == 1 && targets.Count > 1)
+        {
+            effectiveRenderState = effectiveRenderState with
+            {
+                Blends = Enumerable.Repeat(effectiveRenderState.Blends[0], targets.Count).ToArray(),
+            };
         }
 
         lock (_gate)
@@ -486,12 +557,15 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            var guestTextureFormat = GetGuestTextureFormat(
-                target.Format,
-                target.NumberType);
-            if (guestTextureFormat != 0)
+            foreach (var target in targets)
             {
-                _availableGuestImages[target.Address] = guestTextureFormat;
+                var guestTextureFormat = GetGuestTextureFormat(
+                    target.Format,
+                    target.NumberType);
+                if (guestTextureFormat != 0)
+                {
+                    _availableGuestImages[target.Address] = guestTextureFormat;
+                }
             }
 
             EnqueueGuestWorkLocked(
@@ -507,8 +581,8 @@ internal static unsafe class VulkanVideoPresenter
                         instanceCount,
                         primitiveType,
                         indexBuffer,
-                        renderState ?? VulkanGuestRenderState.Default),
-                    target,
+                        effectiveRenderState),
+                    targets.ToArray(),
                     PublishTarget: true));
         }
     }
@@ -550,12 +624,12 @@ internal static unsafe class VulkanVideoPresenter
                         4,
                         null,
                         VulkanGuestRenderState.Default),
-                    new VulkanGuestRenderTarget(
+                    [new VulkanGuestRenderTarget(
                         Address: 0,
                         width,
                         height,
                         Format: 12,
-                        NumberType: 7),
+                        NumberType: 7)],
                     PublishTarget: false));
         }
     }
@@ -608,7 +682,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             // VideoOut registration does not imply a rendered Vulkan image.
             var known = _gpuGuestImages.ContainsKey(address);
-            if (ShouldTracePresentedGuestImageContentsForDiagnostics())
+            if (ShouldTraceGuestImageSubmissionsForDiagnostics())
             {
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] vk.submit_call kind=TrySubmitGuestImage addr=0x{address:X16} " +
@@ -645,7 +719,9 @@ internal static unsafe class VulkanVideoPresenter
                 sequence,
                 GuestDrawKind.None,
                 TranslatedDraw: null,
-                RequiredGuestWorkSequence: 0,
+                // A flip targets the image produced by all work already queued
+                // for this frame.  Do not expose it until those draws finish.
+                RequiredGuestWorkSequence: _enqueuedGuestWorkSequence,
                 IsSplash: false,
                 GuestImageAddress: address);
             System.Threading.Monitor.PulseAll(_gate);
@@ -785,25 +861,100 @@ internal static unsafe class VulkanVideoPresenter
         return true;
     }
 
-    private static uint GetGuestTextureFormat(uint format, uint numberType) =>
-        (format, numberType) switch
+    private static uint GetGuestTextureFormat(uint format, uint numberType)
+    {
+        if (!TryDecodeRenderTargetFormat(format, numberType, out var decoded))
         {
-            (9, _) => 9,
-            (4, 4) => GuestFormatR32Uint,
-            (4, 5) => GuestFormatR32Sint,
-            (4, 7) => GuestFormatR32Sfloat,
-            (5, 4) => GuestFormatR16G16Uint,
-            (5, 5) => GuestFormatR16G16Sint,
-            (5, 7) => GuestFormatR16G16Sfloat,
-            (10, 4) => GuestFormatR8G8B8A8Uint,
-            (10, 5) => GuestFormatR8G8B8A8Sint,
-            (10, _) => 56,
-            (12, 4) => GuestFormatR16G16B16A16Uint,
-            (12, 5) => GuestFormatR16G16B16A16Sint,
-            (12, 7) => 71,
-            (_, 0) when IsKnownGuestTextureFormat(format) => format,
+            return 0;
+        }
+
+        return decoded.Format switch
+        {
+            Format.R8Unorm => 36,
+            Format.R8Uint => 49,
+            Format.R8G8Unorm => 3,
+            Format.A2R10G10B10UnormPack32 => 9,
+            Format.B10G11R11UfloatPack32 => 7,
+            Format.R32Uint => GuestFormatR32Uint,
+            Format.R32Sint => GuestFormatR32Sint,
+            Format.R32Sfloat => GuestFormatR32Sfloat,
+            Format.R16G16Unorm => 5,
+            Format.R16G16Uint => GuestFormatR16G16Uint,
+            Format.R16G16Sint => GuestFormatR16G16Sint,
+            Format.R16G16Sfloat => GuestFormatR16G16Sfloat,
+            Format.R32G32Sfloat => 75,
+            Format.R8G8B8A8Unorm => 56,
+            Format.R8G8B8A8Uint => GuestFormatR8G8B8A8Uint,
+            Format.R8G8B8A8Sint => GuestFormatR8G8B8A8Sint,
+            Format.R16G16B16A16Unorm => 12,
+            Format.R16G16B16A16Uint => GuestFormatR16G16B16A16Uint,
+            Format.R16G16B16A16Sint => GuestFormatR16G16B16A16Sint,
+            Format.R16G16B16A16Sfloat => 71,
+            Format.R32G32B32A32Sfloat => 14,
             _ => 0,
         };
+    }
+
+    internal static bool TryDecodeRenderTargetFormat(
+        uint dataFormat,
+        uint numberType,
+        out VulkanRenderTargetFormat result)
+    {
+        var format = (dataFormat, numberType) switch
+        {
+            (4, 4) => Format.R32Uint,
+            (4, 5) => Format.R32Sint,
+            (4, 7) => Format.R32Sfloat,
+            (5, 4) => Format.R16G16Uint,
+            (5, 5) => Format.R16G16Sint,
+            (5, 7) => Format.R16G16Sfloat,
+            (9, _) => Format.A2R10G10B10UnormPack32,
+            (10, 4) => Format.R8G8B8A8Uint,
+            (10, 5) => Format.R8G8B8A8Sint,
+            (10, _) => Format.R8G8B8A8Unorm,
+            (12, 4) => Format.R16G16B16A16Uint,
+            (12, 5) => Format.R16G16B16A16Sint,
+            (12, 7) => Format.R16G16B16A16Sfloat,
+            (GuestFormatR32Uint, _) or (20, 0) => Format.R32Uint,
+            (GuestFormatR32Sint, _) => Format.R32Sint,
+            (GuestFormatR32Sfloat, _) or (29, 0) or (4, 0) => Format.R32Sfloat,
+            (GuestFormatR16G16Uint, _) => Format.R16G16Uint,
+            (GuestFormatR16G16Sint, _) => Format.R16G16Sint,
+            (GuestFormatR16G16Sfloat, _) => Format.R16G16Sfloat,
+            (GuestFormatR8G8B8A8Uint, _) => Format.R8G8B8A8Uint,
+            (GuestFormatR8G8B8A8Sint, _) => Format.R8G8B8A8Sint,
+            (GuestFormatR16G16B16A16Uint, _) => Format.R16G16B16A16Uint,
+            (GuestFormatR16G16B16A16Sint, _) => Format.R16G16B16A16Sint,
+            (1, 0) or (36, 0) => Format.R8Unorm,
+            (49, 0) => Format.R8Uint,
+            (3, 0) => Format.R8G8Unorm,
+            (5, 0) => Format.R16G16Unorm,
+            (7, 0) => Format.B10G11R11UfloatPack32,
+            (12, 0) => Format.R16G16B16A16Unorm,
+            (13, 0) or (14, 0) => Format.R32G32B32A32Sfloat,
+            (22, 0) or (71, 0) => Format.R16G16B16A16Sfloat,
+            (56, 0) or (62, 0) or (64, 0) => Format.R8G8B8A8Unorm,
+            (75, 0) => Format.R32G32Sfloat,
+            _ => Format.Undefined,
+        };
+
+        if (format == Format.Undefined)
+        {
+            result = default;
+            return false;
+        }
+
+        var outputKind = format switch
+        {
+            Format.R8Uint or Format.R32Uint or Format.R16G16Uint or
+                Format.R8G8B8A8Uint or Format.R16G16B16A16Uint => Gen5PixelOutputKind.Uint,
+            Format.R32Sint or Format.R16G16Sint or Format.R8G8B8A8Sint or
+                Format.R16G16B16A16Sint => Gen5PixelOutputKind.Sint,
+            _ => Gen5PixelOutputKind.Float,
+        };
+        result = new VulkanRenderTargetFormat(format, outputKind);
+        return true;
+    }
 
     private static bool IsKnownGuestTextureFormat(uint format) =>
         format is 4 or 5 or 7 or 9 or 13 or 14 or 22 or 29 or 36 or 56 or 62 or 64 or 71;
@@ -826,6 +977,200 @@ internal static unsafe class VulkanVideoPresenter
         return pixels;
     }
 
+    private static void StartPresenterLocked()
+    {
+        if (HostMainThread.IsAvailable)
+        {
+            // GLFW windowing must run on the process main thread (AppKit on
+            // macOS, X11's single event queue on Linux), so hand the whole
+            // window loop to the main-thread pump the CLI parked for us.
+            // _thread only marks the presenter as running; Run() clears it on
+            // exit either way.
+            _thread = Thread.CurrentThread;
+            HostMainThread.SetShutdownRequestHandler(RequestClose);
+            HostMainThread.Post(Run);
+            return;
+        }
+
+        _thread = new Thread(Run)
+        {
+            IsBackground = true,
+            Name = "SharpEmu Vulkan VideoOut",
+        };
+        _thread.Start();
+    }
+
+    /// <summary>
+    /// Asks a running presenter to close its window; used at emulator
+    /// shutdown so a main-thread-hosted window loop returns to the pump.
+    /// </summary>
+    public static void RequestClose()
+    {
+        Volatile.Write(ref _presenterCloseRequested, true);
+    }
+
+    /// <summary>
+    /// GLFW resolves Vulkan with dlopen("libvulkan.1.dylib"), which cannot
+    /// find the app-local MoltenVK on macOS (Homebrew's Vulkan libraries are
+    /// arm64-only and this is an x86-64 process). GLFW 3.4 accepts the
+    /// loader entry point directly instead, so hand it MoltenVK's
+    /// vkGetInstanceProcAddr before any window exists.
+    /// </summary>
+    private static unsafe void InitializeMacVulkanLoader()
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
+        try
+        {
+            nint vulkan = 0;
+            foreach (var candidate in new[]
+            {
+                Path.Combine(AppContext.BaseDirectory, "libvulkan.1.dylib"),
+                Path.Combine(AppContext.BaseDirectory, "libMoltenVK.dylib"),
+                "libvulkan.1.dylib",
+                "libMoltenVK.dylib",
+            })
+            {
+                if (System.Runtime.InteropServices.NativeLibrary.TryLoad(candidate, out vulkan))
+                {
+                    break;
+                }
+            }
+
+            if (vulkan == 0 ||
+                !System.Runtime.InteropServices.NativeLibrary.TryGetExport(
+                    vulkan, "vkGetInstanceProcAddr", out var procAddr))
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] No Vulkan loader for GLFW; place a universal libMoltenVK.dylib " +
+                    "next to SharpEmu as libvulkan.1.dylib.");
+                return;
+            }
+
+            var glfw = System.Runtime.InteropServices.NativeLibrary.Load(
+                Path.Combine(AppContext.BaseDirectory, "libglfw.3.dylib"));
+            var initVulkanLoader = (delegate* unmanaged<nint, void>)
+                System.Runtime.InteropServices.NativeLibrary.GetExport(glfw, "glfwInitVulkanLoader");
+            initVulkanLoader(procAddr);
+            Console.Error.WriteLine("[LOADER][INFO] GLFW Vulkan loader wired to MoltenVK.");
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"[LOADER][WARN] GLFW Vulkan loader setup failed: {exception.Message}");
+        }
+    }
+
+    // GLFW platform enum (GLFW 3.4): glfwInitHint(GLFW_PLATFORM, ...) selects a
+    // backend, glfwGetPlatform() reports the one in use.
+    private const int GlfwPlatformHint = 0x00050003;
+    private const int GlfwPlatformWin32 = 0x00060001;
+    private const int GlfwPlatformCocoa = 0x00060002;
+    private const int GlfwPlatformWayland = 0x00060003;
+    private const int GlfwPlatformX11 = 0x00060004;
+    private const int GlfwPlatformNull = 0x00060005;
+
+    /// <summary>
+    /// GLFW's native Wayland backend does not reliably map the Vulkan window
+    /// with some drivers (notably NVIDIA): the surface presents frames but the
+    /// window never becomes visible, so the game runs with no picture while
+    /// audio works. XWayland is dependable, so on a Wayland session that also
+    /// exposes an X server (DISPLAY set) we force GLFW's X11 backend through
+    /// its GLFW_PLATFORM init hint before GLFW initializes — the supported way
+    /// to pick a backend, applied by calling into the same libglfw GLFW loads.
+    /// Opt back into native Wayland with SHARPEMU_ENABLE_WAYLAND=1.
+    /// </summary>
+    private static unsafe void PreferX11OnLinuxWayland()
+    {
+        if (!OperatingSystem.IsLinux() ||
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_ENABLE_WAYLAND"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        // Only steer on a Wayland session (WAYLAND_DISPLAY set). Forcing X11
+        // needs an X server to fall back to (XWayland, DISPLAY set); without
+        // one, forcing it would make glfwInit fail outright, so leave GLFW
+        // alone and say why the window may not appear.
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY")))
+        {
+            return;
+        }
+
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")))
+        {
+            Console.Error.WriteLine(
+                "[LOADER][WARN] Wayland session without an X server (DISPLAY unset); " +
+                "cannot steer GLFW to XWayland. If the window does not appear, install " +
+                "XWayland, or run natively with SHARPEMU_ENABLE_WAYLAND=1.");
+            return;
+        }
+
+        if (!TryLoadGlfw(out var glfw))
+        {
+            return;
+        }
+
+        try
+        {
+            var initHint = (delegate* unmanaged<int, int, void>)
+                System.Runtime.InteropServices.NativeLibrary.GetExport(glfw, "glfwInitHint");
+            initHint(GlfwPlatformHint, GlfwPlatformX11);
+            Console.Error.WriteLine(
+                "[LOADER][INFO] Wayland session detected; requested GLFW X11/XWayland " +
+                "backend (set SHARPEMU_ENABLE_WAYLAND=1 to force native Wayland).");
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] Could not set GLFW X11 platform hint: {exception.Message}");
+        }
+    }
+
+    /// <summary>Logs the backend GLFW actually selected, so a "no window"
+    /// report shows Wayland vs X11 at a glance.</summary>
+    private static unsafe void LogGlfwPlatformInUse()
+    {
+        if (OperatingSystem.IsWindows() || !TryLoadGlfw(out var glfw))
+        {
+            return;
+        }
+
+        try
+        {
+            var getPlatform = (delegate* unmanaged<int>)
+                System.Runtime.InteropServices.NativeLibrary.GetExport(glfw, "glfwGetPlatform");
+            var platform = getPlatform();
+            var label = platform switch
+            {
+                GlfwPlatformWin32 => "Win32",
+                GlfwPlatformCocoa => "Cocoa",
+                GlfwPlatformWayland => "Wayland",
+                GlfwPlatformX11 => "X11",
+                GlfwPlatformNull => "Null",
+                _ => $"0x{platform:X}",
+            };
+            Console.Error.WriteLine($"[LOADER][INFO] GLFW windowing platform in use: {label}");
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"[LOADER][WARN] Could not query GLFW platform: {exception.Message}");
+        }
+    }
+
+    private static bool TryLoadGlfw(out nint handle)
+    {
+        var name = OperatingSystem.IsMacOS() ? "libglfw.3.dylib" : "libglfw.so.3";
+        return System.Runtime.InteropServices.NativeLibrary.TryLoad(
+            Path.Combine(AppContext.BaseDirectory, name), out handle) ||
+            System.Runtime.InteropServices.NativeLibrary.TryLoad(name, out handle);
+    }
+
     private static void Run()
     {
         uint width;
@@ -835,6 +1180,9 @@ internal static unsafe class VulkanVideoPresenter
             width = _windowWidth == 0 ? _latestPresentation?.Width ?? 1280 : _windowWidth;
             height = _windowHeight == 0 ? _latestPresentation?.Height ?? 720 : _windowHeight;
         }
+
+        InitializeMacVulkanLoader();
+        PreferX11OnLinuxWayland();
 
         try
         {
@@ -948,6 +1296,8 @@ internal static unsafe class VulkanVideoPresenter
         private DebugUtilsMessengerEXT _debugMessenger;
         private ExtDebugUtils? _debugUtils;
         private PhysicalDevice _physicalDevice;
+        private bool _supportsIndependentBlend;
+        private uint _maxColorAttachments;
         private Device _device;
         private PipelineCache _pipelineCache;
         private string? _pipelineCachePath;
@@ -993,6 +1343,8 @@ internal static unsafe class VulkanVideoPresenter
         private bool _swapchainRecreateDeferred;
         private bool _tracedPresentedSwapchain;
         private bool _swapchainReadbackPending;
+        private static int _guestImageDumpSequence;
+        private readonly System.Collections.Concurrent.ConcurrentQueue<GuestImageResource> _pendingAliasImageDumps = new();
         private bool _deviceLost;
         private bool _deviceLostLogged;
         private int _directPresentationCount;
@@ -1024,9 +1376,9 @@ internal static unsafe class VulkanVideoPresenter
         private readonly record struct GraphicsPipelineKey(
             string VertexShader,
             string FragmentShader,
-            Format RenderTargetFormat,
+            string RenderTargetLayout,
             PrimitiveTopology Topology,
-            VulkanGuestBlendState Blend,
+            string BlendLayout,
             string ResourceLayout,
             string VertexLayout);
 
@@ -1066,9 +1418,11 @@ internal static unsafe class VulkanVideoPresenter
             public uint VertexCount = 3;
             public uint InstanceCount = 1;
             public PrimitiveTopology Topology = PrimitiveTopology.TriangleList;
-            public VulkanGuestBlendState Blend = VulkanGuestBlendState.Default;
+            public VulkanGuestBlendState[] Blends = [VulkanGuestBlendState.Default];
             public VulkanGuestRect? Scissor;
             public VulkanGuestViewport? Viewport;
+            public RenderPass TransientRenderPass;
+            public Framebuffer TransientFramebuffer;
         }
 
         private sealed class TextureResource
@@ -1154,7 +1508,13 @@ internal static unsafe class VulkanVideoPresenter
             _window = Window.Create(options);
             _window.Load += Initialize;
             _window.Render += Render;
-            _window.Closing += DisposeVulkan;
+            _window.Closing += OnWindowClosing;
+        }
+
+        private void OnWindowClosing()
+        {
+            VideoOutExports.NotifyPresentationWindowClosed();
+            DisposeVulkan();
         }
 
         public void Run() => _window.Run();
@@ -1180,6 +1540,20 @@ internal static unsafe class VulkanVideoPresenter
             {
                 var icon = new RawImage((int)iconWidth, (int)iconHeight, iconPixels);
                 _window.SetWindowIcon(ref icon);
+            }
+
+            LogGlfwPlatformInUse();
+            if (!OperatingSystem.IsWindows())
+            {
+                try
+                {
+                    Pad.HostWindowInput.Attach(_window.CreateInput());
+                    Console.Error.WriteLine("[LOADER][INFO] Window keyboard input attached for pad emulation.");
+                }
+                catch (Exception exception)
+                {
+                    Console.Error.WriteLine($"[LOADER][WARN] Window keyboard input unavailable: {exception.Message}");
+                }
             }
 
             WaitForRenderDocAttachIfRequested();
@@ -1394,8 +1768,10 @@ internal static unsafe class VulkanVideoPresenter
 
                 var extensions = _window.VkSurface!.GetRequiredExtensions(out var extensionCount);
                 byte* debugUtilsExtension = null;
+                byte* portabilityExtension = null;
+                var instanceCreateFlags = InstanceCreateFlags.None;
                 var enabledExtensionCount = (int)extensionCount;
-                var enabledExtensions = stackalloc byte*[(int)extensionCount + 1];
+                var enabledExtensions = stackalloc byte*[(int)extensionCount + 2];
                 for (var index = 0; index < (int)extensionCount; index++)
                 {
                     enabledExtensions[index] = extensions[index];
@@ -1405,6 +1781,15 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     debugUtilsExtension = (byte*)SilkMarshal.StringToPtr(DebugUtilsExtensionName);
                     enabledExtensions[enabledExtensionCount++] = debugUtilsExtension;
+                }
+
+                if (IsInstanceExtensionAvailable(PortabilityEnumerationExtensionName))
+                {
+                    // MoltenVK is a portability (non-conformant) implementation;
+                    // without this flag + extension the loader hides it.
+                    portabilityExtension = (byte*)SilkMarshal.StringToPtr(PortabilityEnumerationExtensionName);
+                    enabledExtensions[enabledExtensionCount++] = portabilityExtension;
+                    instanceCreateFlags |= InstanceCreateFlags.EnumeratePortabilityBitKhr;
                 }
 
                 if (enableValidation && IsInstanceLayerAvailable("VK_LAYER_KHRONOS_validation"))
@@ -1425,6 +1810,7 @@ internal static unsafe class VulkanVideoPresenter
                 var createInfo = new InstanceCreateInfo
                 {
                     SType = StructureType.InstanceCreateInfo,
+                    Flags = instanceCreateFlags,
                     PApplicationInfo = &applicationInfo,
                     EnabledExtensionCount = (uint)enabledExtensionCount,
                     PpEnabledExtensionNames = enabledExtensions,
@@ -1453,6 +1839,10 @@ internal static unsafe class VulkanVideoPresenter
                     {
                         SilkMarshal.Free((nint)debugUtilsExtension);
                     }
+                    if (portabilityExtension is not null)
+                    {
+                        SilkMarshal.Free((nint)portabilityExtension);
+                    }
                 }
             }
             finally
@@ -1463,6 +1853,40 @@ internal static unsafe class VulkanVideoPresenter
                     SilkMarshal.Free((nint)validationLayerName);
                 }
             }
+        }
+
+        private bool IsDeviceExtensionAvailable(string extensionName)
+        {
+            uint extensionCount = 0;
+            if (_vk.EnumerateDeviceExtensionProperties(_physicalDevice, (byte*)null, &extensionCount, null) != Result.Success ||
+                extensionCount == 0)
+            {
+                return false;
+            }
+
+            var properties = new ExtensionProperties[extensionCount];
+            fixed (ExtensionProperties* propertyPointer = properties)
+            {
+                if (_vk.EnumerateDeviceExtensionProperties(
+                        _physicalDevice,
+                        (byte*)null,
+                        &extensionCount,
+                        propertyPointer) != Result.Success)
+                {
+                    return false;
+                }
+
+                var expected = Encoding.UTF8.GetBytes(extensionName);
+                for (var index = 0; index < extensionCount; index++)
+                {
+                    if (Utf8NullTerminatedEquals(propertyPointer[index].ExtensionName, expected))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         private bool IsInstanceLayerAvailable(string layerName)
@@ -1598,9 +2022,14 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             _vk.GetPhysicalDeviceProperties(_physicalDevice, out var selected);
+            _maxColorAttachments = selected.Limits.MaxColorAttachments;
             var selectedName = SilkMarshal.PtrToString((nint)selected.DeviceName) ?? "unknown";
+            var apiMajor = (selected.ApiVersion >> 22) & 0x7F;
+            var apiMinor = (selected.ApiVersion >> 12) & 0x3FF;
+            var apiPatch = selected.ApiVersion & 0xFFF;
             Console.Error.WriteLine(
-                $"[LOADER][INFO] Vulkan device: {selectedName} ({selected.DeviceType})");
+                $"[LOADER][INFO] Vulkan device: {selectedName} " +
+                $"(type={selected.DeviceType}, api={apiMajor}.{apiMinor}.{apiPatch})");
             VideoOutExports.SetSelectedGpuName(selectedName);
             _window.Title = VideoOutExports.GetWindowTitle();
         }
@@ -1644,8 +2073,10 @@ internal static unsafe class VulkanVideoPresenter
                 PQueuePriorities = &priority,
             };
             _vk.GetPhysicalDeviceFeatures(_physicalDevice, out var supportedFeatures);
+            _supportsIndependentBlend = supportedFeatures.IndependentBlend;
             var enabledFeatures = new PhysicalDeviceFeatures
             {
+                IndependentBlend = supportedFeatures.IndependentBlend,
                 VertexPipelineStoresAndAtomics = supportedFeatures.VertexPipelineStoresAndAtomics,
                 FragmentStoresAndAtomics = supportedFeatures.FragmentStoresAndAtomics,
                 ShaderInt64 = supportedFeatures.ShaderInt64,
@@ -1708,6 +2139,7 @@ internal static unsafe class VulkanVideoPresenter
             };
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsMaintenance8 = maintenance8Features.Maintenance8;
+            var supportsRobustBufferAccess2 = robustness2Features.RobustBufferAccess2;
             var supportsRobustImageAccess2 = robustness2Features.RobustImageAccess2;
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
             var supportsRobustness2 = supportsRobustImageAccess2 || supportsNullDescriptor;
@@ -1728,9 +2160,10 @@ internal static unsafe class VulkanVideoPresenter
             var swapchainExtension = (byte*)SilkMarshal.StringToPtr("VK_KHR_swapchain");
             var maintenance8Extension = (byte*)SilkMarshal.StringToPtr("VK_KHR_maintenance8");
             var robustness2Extension = (byte*)SilkMarshal.StringToPtr("VK_EXT_robustness2");
+            var portabilitySubsetExtension = (byte*)SilkMarshal.StringToPtr(PortabilitySubsetExtensionName);
             try
             {
-                var extensions = stackalloc byte*[3];
+                var extensions = stackalloc byte*[4];
                 var extensionCount = 0u;
                 extensions[extensionCount++] = swapchainExtension;
                 if (supportsMaintenance8)
@@ -1743,10 +2176,17 @@ internal static unsafe class VulkanVideoPresenter
                     extensions[extensionCount++] = robustness2Extension;
                 }
 
+                if (IsDeviceExtensionAvailable(PortabilitySubsetExtensionName))
+                {
+                    // The spec requires enabling this when the (MoltenVK)
+                    // device advertises it.
+                    extensions[extensionCount++] = portabilitySubsetExtension;
+                }
+
                 maintenance8Features.Maintenance8 = supportsMaintenance8;
                 maintenance8Features.PNext = null;
                 robustness2Features.RobustBufferAccess2 =
-                    supportsRobustImageAccess2 && supportedFeatures.RobustBufferAccess;
+                    supportsRobustBufferAccess2 && supportedFeatures.RobustBufferAccess;
                 robustness2Features.RobustImageAccess2 = supportsRobustImageAccess2;
                 robustness2Features.NullDescriptor = supportsNullDescriptor;
                 robustness2Features.PNext = supportsMaintenance8 ? &maintenance8Features : null;
@@ -1775,6 +2215,7 @@ internal static unsafe class VulkanVideoPresenter
                 SilkMarshal.Free((nint)swapchainExtension);
                 SilkMarshal.Free((nint)maintenance8Extension);
                 SilkMarshal.Free((nint)robustness2Extension);
+                SilkMarshal.Free((nint)portabilitySubsetExtension);
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
@@ -2144,6 +2585,14 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
+        private void WaitForAllGuestSubmissions()
+        {
+            while (_pendingGuestSubmissions.Count != 0)
+            {
+                CollectCompletedGuestSubmissions(waitForOldest: true);
+            }
+        }
+
         private void CollectCompletedGuestSubmissions(bool waitForOldest)
         {
             if (waitForOldest && _pendingGuestSubmissions.TryPeek(out var oldest))
@@ -2187,13 +2636,15 @@ internal static unsafe class VulkanVideoPresenter
 
         private IReadOnlyList<GuestImageResource> GetTraceImages(
             TranslatedDrawResources resources,
-            GuestImageResource? renderTarget = null)
+            IReadOnlyList<GuestImageResource>? renderTargets = null)
         {
             var images = new HashSet<GuestImageResource>();
-            if (renderTarget is not null &&
-                ShouldTraceGuestImageContents(renderTarget))
+            foreach (var renderTarget in renderTargets ?? [])
             {
-                images.Add(renderTarget);
+                if (ShouldTraceGuestImageContents(renderTarget))
+                {
+                    images.Add(renderTarget);
+                }
             }
 
             foreach (var texture in resources.Textures)
@@ -2424,10 +2875,16 @@ internal static unsafe class VulkanVideoPresenter
         private TranslatedDrawResources CreateTranslatedDrawResources(
             VulkanTranslatedGuestDraw draw,
             RenderPass renderPass,
-            Format renderTargetFormat,
+            IReadOnlyList<Format> renderTargetFormats,
             Extent2D extent)
         {
             var vertexSpirv = draw.VertexSpirv;
+            if (draw.RenderState.Blends.Count != renderTargetFormats.Count)
+            {
+                throw new InvalidOperationException(
+                    "color attachment formats and blend states must have matching counts");
+            }
+
             if (vertexSpirv.Length == 0 &&
                 !TryCompileFullscreenVertexShader(
                     draw.AttributeCount,
@@ -2447,7 +2904,7 @@ internal static unsafe class VulkanVideoPresenter
                 VertexCount = GetDrawVertexCount(draw.PrimitiveType, draw.VertexCount, draw.IndexBuffer),
                 InstanceCount = Math.Max(draw.InstanceCount, 1),
                 Topology = GetPrimitiveTopology(draw.PrimitiveType),
-                Blend = draw.RenderState.Blend,
+                Blends = draw.RenderState.Blends.ToArray(),
                 Scissor = draw.RenderState.Scissor,
                 Viewport = draw.RenderState.Viewport,
             };
@@ -2496,7 +2953,7 @@ internal static unsafe class VulkanVideoPresenter
                     vertexSpirv,
                     draw.PixelSpirv,
                     renderPass,
-                    renderTargetFormat,
+                    renderTargetFormats,
                     extent);
                 return resources;
             }
@@ -2793,15 +3250,18 @@ internal static unsafe class VulkanVideoPresenter
             byte[] vertexSpirv,
             byte[] fragmentSpirv,
             RenderPass renderPass,
-            Format renderTargetFormat,
+            IReadOnlyList<Format> renderTargetFormats,
             Extent2D extent)
         {
             var pipelineKey = new GraphicsPipelineKey(
                 GetShaderDigest(vertexSpirv),
                 GetShaderDigest(fragmentSpirv),
-                renderTargetFormat,
+                string.Join(',', renderTargetFormats.Select(format => (uint)format)),
                 resources.Topology,
-                resources.Blend,
+                string.Join(';', resources.Blends.Select(blend =>
+                    $"{(blend.Enable ? 1 : 0)}:{blend.ColorSrcFactor}:{blend.ColorDstFactor}:" +
+                    $"{blend.ColorFunc}:{blend.AlphaSrcFactor}:{blend.AlphaDstFactor}:" +
+                    $"{blend.AlphaFunc}:{(blend.SeparateAlphaBlend ? 1 : 0)}:{blend.WriteMask}")),
                 GetResourceLayoutKey(resources),
                 GetVertexLayoutKey(resources));
             if (_graphicsPipelines.TryGetValue(pipelineKey, out var cachedPipeline))
@@ -2902,29 +3362,33 @@ internal static unsafe class VulkanVideoPresenter
                         SType = StructureType.PipelineMultisampleStateCreateInfo,
                         RasterizationSamples = SampleCountFlags.Count1Bit,
                     };
-                    var colorBlendAttachment = new PipelineColorBlendAttachmentState
+                    var colorBlendAttachments = stackalloc PipelineColorBlendAttachmentState[resources.Blends.Length];
+                    for (var index = 0; index < resources.Blends.Length; index++)
                     {
-                        BlendEnable = resources.Blend.Enable,
-                        SrcColorBlendFactor = ToVkBlendFactor(resources.Blend.ColorSrcFactor),
-                        DstColorBlendFactor = ToVkBlendFactor(resources.Blend.ColorDstFactor),
-                        ColorBlendOp = ToVkBlendOp(resources.Blend.ColorFunc),
-                        SrcAlphaBlendFactor = resources.Blend.SeparateAlphaBlend
-                            ? ToVkBlendFactor(resources.Blend.AlphaSrcFactor)
-                            : ToVkBlendFactor(resources.Blend.ColorSrcFactor),
-                        DstAlphaBlendFactor = resources.Blend.SeparateAlphaBlend
-                            ? ToVkBlendFactor(resources.Blend.AlphaDstFactor)
-                            : ToVkBlendFactor(resources.Blend.ColorDstFactor),
-                        AlphaBlendOp = resources.Blend.SeparateAlphaBlend
-                            ? ToVkBlendOp(resources.Blend.AlphaFunc)
-                            : ToVkBlendOp(resources.Blend.ColorFunc),
-                        ColorWriteMask =
-                            ToVkColorWriteMask(resources.Blend.WriteMask),
-                    };
+                        var blend = resources.Blends[index];
+                        colorBlendAttachments[index] = new PipelineColorBlendAttachmentState
+                        {
+                            BlendEnable = blend.Enable,
+                            SrcColorBlendFactor = ToVkBlendFactor(blend.ColorSrcFactor),
+                            DstColorBlendFactor = ToVkBlendFactor(blend.ColorDstFactor),
+                            ColorBlendOp = ToVkBlendOp(blend.ColorFunc),
+                            SrcAlphaBlendFactor = blend.SeparateAlphaBlend
+                                ? ToVkBlendFactor(blend.AlphaSrcFactor)
+                                : ToVkBlendFactor(blend.ColorSrcFactor),
+                            DstAlphaBlendFactor = blend.SeparateAlphaBlend
+                                ? ToVkBlendFactor(blend.AlphaDstFactor)
+                                : ToVkBlendFactor(blend.ColorDstFactor),
+                            AlphaBlendOp = blend.SeparateAlphaBlend
+                                ? ToVkBlendOp(blend.AlphaFunc)
+                                : ToVkBlendOp(blend.ColorFunc),
+                            ColorWriteMask = ToVkColorWriteMask(blend.WriteMask),
+                        };
+                    }
                     var colorBlend = new PipelineColorBlendStateCreateInfo
                     {
                         SType = StructureType.PipelineColorBlendStateCreateInfo,
-                        AttachmentCount = 1,
-                        PAttachments = &colorBlendAttachment,
+                        AttachmentCount = (uint)resources.Blends.Length,
+                        PAttachments = colorBlendAttachments,
                     };
                     var dynamicStateValues = stackalloc DynamicState[2];
                     dynamicStateValues[0] = DynamicState.Viewport;
@@ -3195,6 +3659,17 @@ internal static unsafe class VulkanVideoPresenter
                         $"texture={texture.Width}x{texture.Height} " +
                         $"image={guestImage.Width}x{guestImage.Height} " +
                         $"tile={texture.TileMode} format={vkFormat}");
+                }
+
+                if (string.Equals(
+                        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGES"),
+                        "alias",
+                        StringComparison.OrdinalIgnoreCase) &&
+                    _tracedGuestImageContents.Add(guestImage.Address))
+                {
+                    // Deferred: reading back here would clobber the command
+                    // buffer mid-recording; drained after the next present.
+                    _pendingAliasImageDumps.Enqueue(guestImage);
                 }
 
                 if (TryCreateCpuTextureRefreshResource(texture, guestImage, view, out var refresh))
@@ -4290,6 +4765,14 @@ internal static unsafe class VulkanVideoPresenter
                 checked((uint)(bottom - top)));
         }
 
+        private static readonly float ViewportDebugEpsilon = float.TryParse(
+            Environment.GetEnvironmentVariable("SHARPEMU_VIEWPORT_EPSILON"),
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var viewportEpsilon)
+            ? viewportEpsilon
+            : 0f;
+
         private static Viewport ClampViewport(VulkanGuestViewport? viewport, Extent2D extent)
         {
             if (viewport is not { } rect)
@@ -4297,21 +4780,26 @@ internal static unsafe class VulkanVideoPresenter
                 return new Viewport(0, 0, extent.Width, extent.Height, 0, 1);
             }
 
-            var maxX = (float)extent.Width;
-            var maxY = (float)extent.Height;
-            var left = Math.Clamp(rect.X, 0f, maxX);
-            var right = Math.Clamp(rect.X + rect.Width, left, maxX);
-            var yOrigin = Math.Clamp(rect.Y, 0f, maxY);
-            var yEnd = Math.Clamp(rect.Y + rect.Height, 0f, maxY);
+            // Do NOT trim the rectangle to the render target: Vulkan allows
+            // viewports that extend beyond the framebuffer (rendering is
+            // confined by the scissor), and trimming changes the guest's
+            // scale and offset. That skews texel addressing on 1:1 draws -
+            // source rows get skipped or duplicated - which shredded the
+            // game's pre-composed tile surfaces. Only guard what the spec
+            // requires: a positive width and hardware viewport bounds.
+            const float bound = 32767f;
+            var x = Math.Clamp(rect.X, -bound, bound);
+            var y = Math.Clamp(rect.Y, -bound, bound);
+            var width = Math.Clamp(rect.Width, 1e-3f, bound);
+            var height = Math.Clamp(rect.Height, -bound, bound);
+            if (height == 0f)
+            {
+                height = extent.Height;
+            }
+
             var minDepth = Math.Clamp(rect.MinDepth, 0f, 1f);
             var maxDepth = Math.Clamp(rect.MaxDepth, minDepth, 1f);
-            return new Viewport(
-                left,
-                yOrigin,
-                right - left,
-                yEnd - yOrigin,
-                minDepth,
-                maxDepth);
+            return new Viewport(x, y, width, height, minDepth, maxDepth);
         }
 
         private static byte[] CreateFallbackTexturePixels(uint format, uint width, uint height, ulong expectedSize)
@@ -4364,6 +4852,12 @@ internal static unsafe class VulkanVideoPresenter
             return blockBytes == 0
                 ? checked((ulong)width * height * GetTextureBytesPerPixel(format))
                 : checked(((ulong)width + 3) / 4 * (((ulong)height + 3) / 4) * blockBytes);
+        }
+
+        private bool SupportsColorAttachment(Format format)
+        {
+            _vk.GetPhysicalDeviceFormatProperties(_physicalDevice, format, out var properties);
+            return (properties.OptimalTilingFeatures & FormatFeatureFlags.ColorAttachmentBit) != 0;
         }
 
         private static Format GetTextureFormat(uint format, uint numberType) =>
@@ -4426,26 +4920,6 @@ internal static unsafe class VulkanVideoPresenter
                 (181, _) => Format.BC7UnormBlock,
                 (182, _) => Format.BC7SrgbBlock,
                 _ => Format.R8G8B8A8Unorm,
-            };
-
-        private static Format GetRenderTargetFormat(uint format, uint numberType) =>
-            (format, numberType) switch
-            {
-                (4, 4) => Format.R32Uint,
-                (4, 5) => Format.R32Sint,
-                (4, 7) => Format.R32Sfloat,
-                (5, 4) => Format.R16G16Uint,
-                (5, 5) => Format.R16G16Sint,
-                (5, 7) => Format.R16G16Sfloat,
-                (9, _) => Format.A2R10G10B10UnormPack32,
-                (10, 4) => Format.R8G8B8A8Uint,
-                (10, 5) => Format.R8G8B8A8Sint,
-                (10, _) => Format.R8G8B8A8Unorm,
-                (12, 4) => Format.R16G16B16A16Uint,
-                (12, 5) => Format.R16G16B16A16Sint,
-                (12, 7) => Format.R16G16B16A16Sfloat,
-                (_, 0) => GetTextureFormat(format, numberType),
-                _ => Format.Undefined,
             };
 
         private static bool IsBlockCompressedFormat(Format format) =>
@@ -4688,47 +5162,114 @@ internal static unsafe class VulkanVideoPresenter
 
         private void ExecuteOffscreenDraw(VulkanOffscreenGuestDraw work)
         {
-            if (_deviceLost)
+            if (_deviceLost || work.Targets.Count == 0)
             {
                 return;
             }
 
-            var format = GetRenderTargetFormat(work.Target.Format, work.Target.NumberType);
-            if (format == Format.Undefined)
+            if (work.Targets.Count > _maxColorAttachments)
             {
                 Console.Error.WriteLine(
-                    $"[LOADER][WARN] Vulkan skipped unsupported render target " +
-                    $"addr=0x{work.Target.Address:X16} format={work.Target.Format} " +
-                    $"number={work.Target.NumberType}");
+                    $"[LOADER][WARN] Vulkan skipped MRT draw requesting {work.Targets.Count} color attachments; " +
+                    $"the selected device supports {_maxColorAttachments}.");
                 return;
             }
 
+            var targetFormats = new VulkanRenderTargetFormat[work.Targets.Count];
+            for (var index = 0; index < targetFormats.Length; index++)
+            {
+                var target = work.Targets[index];
+                if (!TryDecodeRenderTargetFormat(target.Format, target.NumberType, out targetFormats[index]) ||
+                    !SupportsColorAttachment(targetFormats[index].Format))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] Vulkan skipped MRT draw with unsupported color target " +
+                        $"format={target.Format} number_type={target.NumberType}.");
+                    return;
+                }
+            }
+
+            if (work.Draw.RenderState.Blends.Count != targetFormats.Length)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] Vulkan skipped MRT draw with mismatched attachment/blend counts.");
+                return;
+            }
+
+            if (targetFormats
+                .Select((format, index) => format.IsInteger && work.Draw.RenderState.Blends[index].Enable)
+                .Any(invalid => invalid))
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] Vulkan skipped MRT draw with blending enabled for an integer attachment.");
+                return;
+            }
+
+            if (!_supportsIndependentBlend &&
+                work.Draw.RenderState.Blends.Skip(1).Any(blend => blend != work.Draw.RenderState.Blends[0]))
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][WARN] Vulkan skipped MRT draw requiring unsupported independentBlend.");
+                return;
+            }
+
+            var formats = targetFormats.Select(target => target.Format).ToArray();
+
+            var targetAddresses = work.Targets
+                .Where(target => target.Address != 0)
+                .Select(target => target.Address)
+                .ToHashSet();
             if (work.Draw.Textures.Any(texture =>
-                    texture.Address == work.Target.Address &&
-                    texture.Address != 0))
+                    targetAddresses.Contains(texture.Address)))
             {
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] Vulkan skipped render-target feedback loop " +
-                    $"addr=0x{work.Target.Address:X16}");
+                    $"targets={string.Join(',', targetAddresses.Select(address => $"0x{address:X16}"))}");
                 return;
             }
 
-            var target = GetOrCreateGuestImage(work.Target, format);
+            var targets = new GuestImageResource[work.Targets.Count];
+            EnsureGuestSubmissionCapacity();
+            for (var index = 0; index < targets.Length; index++)
+            {
+                targets[index] = GetOrCreateGuestImage(work.Targets[index], formats[index]);
+            }
+
+            var firstTarget = targets[0];
             TranslatedDrawResources? resources = null;
             CommandBuffer commandBuffer = default;
             var submitted = false;
+            RenderPass transientRenderPass = default;
+            Framebuffer transientFramebuffer = default;
             try
             {
-                EnsureGuestSubmissionCapacity();
-                var extent = new Extent2D(target.Width, target.Height);
+                var extent = new Extent2D(firstTarget.Width, firstTarget.Height);
+                var renderPass = firstTarget.RenderPass;
+                var framebuffer = firstTarget.Framebuffer;
+                if (targets.Length > 1)
+                {
+                    (renderPass, framebuffer) = CreateRenderPassAndFramebuffer(
+                        formats,
+                        targets.Select(target => target.MipViews[0]).ToArray(),
+                        firstTarget.Width,
+                        firstTarget.Height);
+                    transientRenderPass = renderPass;
+                    transientFramebuffer = framebuffer;
+                }
+
                 resources = CreateTranslatedDrawResources(
                     work.Draw,
-                    target.RenderPass,
-                    target.Format,
+                    renderPass,
+                    formats,
                     extent);
+                resources.TransientRenderPass = transientRenderPass;
+                resources.TransientFramebuffer = transientFramebuffer;
+                transientRenderPass = default;
+                transientFramebuffer = default;
                 resources.DebugName =
-                    $"SharpEmu offscreen rt=0x{work.Target.Address:X16} " +
-                    $"{work.Target.Width}x{work.Target.Height} fmt{work.Target.Format}";
+                    $"SharpEmu offscreen mrt={targets.Length} " +
+                    $"first=0x{work.Targets[0].Address:X16} " +
+                    $"{firstTarget.Width}x{firstTarget.Height}";
 
                 commandBuffer = AllocateGuestCommandBuffer();
                 _commandBuffer = commandBuffer;
@@ -4745,24 +5286,30 @@ internal static unsafe class VulkanVideoPresenter
                 RecordTextureUploads(resources, PipelineStageFlags.FragmentShaderBit);
                 RecordStorageImagesForWrite(resources, PipelineStageFlags.FragmentShaderBit);
 
-                var targetHasPriorContents = target.Initialized || target.InitialUploadPending;
-                var toColorAttachment = new ImageMemoryBarrier
+                var toColorAttachments = stackalloc ImageMemoryBarrier[targets.Length];
+                var anyPriorContents = false;
+                for (var index = 0; index < targets.Length; index++)
                 {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = targetHasPriorContents ? AccessFlags.ShaderReadBit : 0,
-                    DstAccessMask = AccessFlags.ColorAttachmentWriteBit,
-                    OldLayout = targetHasPriorContents
-                        ? ImageLayout.ShaderReadOnlyOptimal
-                        : ImageLayout.Undefined,
-                    NewLayout = ImageLayout.ColorAttachmentOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = target.Image,
-                    SubresourceRange = ColorSubresourceRange(),
-                };
+                    var hasPriorContents = targets[index].Initialized || targets[index].InitialUploadPending;
+                    anyPriorContents |= hasPriorContents;
+                    toColorAttachments[index] = new ImageMemoryBarrier
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = hasPriorContents ? AccessFlags.ShaderReadBit : 0,
+                        DstAccessMask = AccessFlags.ColorAttachmentWriteBit,
+                        OldLayout = hasPriorContents
+                            ? ImageLayout.ShaderReadOnlyOptimal
+                            : ImageLayout.Undefined,
+                        NewLayout = ImageLayout.ColorAttachmentOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = targets[index].Image,
+                        SubresourceRange = ColorSubresourceRange(),
+                    };
+                }
                 _vk.CmdPipelineBarrier(
                     _commandBuffer,
-                    targetHasPriorContents
+                    anyPriorContents
                         ? PipelineStageFlags.AllCommandsBit
                         : PipelineStageFlags.TopOfPipeBit,
                     PipelineStageFlags.ColorAttachmentOutputBit,
@@ -4771,28 +5318,32 @@ internal static unsafe class VulkanVideoPresenter
                     null,
                     0,
                     null,
-                    1,
-                    &toColorAttachment);
+                    (uint)targets.Length,
+                    toColorAttachments);
 
                 RecordTranslatedGraphicsPass(
                     resources,
-                    target.RenderPass,
-                    target.Framebuffer,
+                    renderPass,
+                    framebuffer,
                     extent);
                 RecordStorageImagesForRead(resources, PipelineStageFlags.FragmentShaderBit);
 
-                var toShaderRead = new ImageMemoryBarrier
+                var toShaderRead = stackalloc ImageMemoryBarrier[targets.Length];
+                for (var index = 0; index < targets.Length; index++)
                 {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = AccessFlags.ColorAttachmentWriteBit,
-                    DstAccessMask = AccessFlags.ShaderReadBit,
-                    OldLayout = ImageLayout.ColorAttachmentOptimal,
-                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = target.Image,
-                    SubresourceRange = ColorSubresourceRange(),
-                };
+                    toShaderRead[index] = new ImageMemoryBarrier
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = AccessFlags.ColorAttachmentWriteBit,
+                        DstAccessMask = AccessFlags.ShaderReadBit,
+                        OldLayout = ImageLayout.ColorAttachmentOptimal,
+                        NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = targets[index].Image,
+                        SubresourceRange = ColorSubresourceRange(),
+                    };
+                }
                 _vk.CmdPipelineBarrier(
                     _commandBuffer,
                     PipelineStageFlags.ColorAttachmentOutputBit,
@@ -4802,55 +5353,72 @@ internal static unsafe class VulkanVideoPresenter
                     null,
                     0,
                     null,
-                    1,
-                    &toShaderRead);
+                    (uint)targets.Length,
+                    toShaderRead);
                 EndDebugLabel(_commandBuffer);
 
                 Check(_vk.EndCommandBuffer(_commandBuffer), "vkEndCommandBuffer(offscreen)");
                 SubmitGuestCommandBuffer(
                     commandBuffer,
                     resources,
-                    GetTraceImages(resources, target));
+                    GetTraceImages(resources, targets));
                 submitted = true;
-                target.Initialized = true;
+                foreach (var target in targets)
+                {
+                    target.Initialized = true;
+                }
                 MarkSampledImagesInitialized(resources);
                 MarkStorageImagesInitialized(resources, traceContents: false);
 
-                var guestTextureFormat = VulkanVideoPresenter.GetGuestTextureFormat(
-                    work.Target.Format,
-                    work.Target.NumberType);
-                if (work.PublishTarget && guestTextureFormat != 0)
+                if (work.PublishTarget)
                 {
-                    lock (_gate)
+                    for (var index = 0; index < targets.Length; index++)
                     {
-                        _availableGuestImages[target.Address] = guestTextureFormat;
-                        _gpuGuestImages[target.Address] = guestTextureFormat;
+                        var guestTextureFormat = VulkanVideoPresenter.GetGuestTextureFormat(
+                            work.Targets[index].Format,
+                            work.Targets[index].NumberType);
+                        if (guestTextureFormat == 0)
+                        {
+                            continue;
+                        }
+
+                        lock (_gate)
+                        {
+                            _availableGuestImages[targets[index].Address] = guestTextureFormat;
+                            _gpuGuestImages[targets[index].Address] = guestTextureFormat;
+                        }
                     }
                 }
-                if (ShouldTraceGuestImageWriteForDiagnostics(target.Address))
+                foreach (var target in targets)
                 {
-                    var writeCount = _tracedGuestWriteCounts.TryGetValue(
-                        target.Address,
-                        out var previousCount)
-                        ? previousCount + 1
-                        : 1;
-                    _tracedGuestWriteCounts[target.Address] = writeCount;
-                    if (writeCount <= 3)
+                    var traceSmallWrites =
+                        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_WRITES") == "small" &&
+                        target.Width <= 512 && target.Height <= 256;
+                    if (ShouldTraceGuestImageWriteForDiagnostics(target.Address) || traceSmallWrites)
                     {
-                        _commandBuffer = _presentationCommandBuffer;
-                        Check(
-                            _vk.QueueWaitIdle(_queue),
-                            "vkQueueWaitIdle(guest write trace)");
-                        Console.Error.WriteLine(
-                            $"[LOADER][TRACE] vk.guest_write_sample " +
-                            $"addr=0x{target.Address:X16} write={writeCount} " +
-                            $"ps_bytes={work.Draw.PixelSpirv.Length}");
-                        TraceGuestImageContents(target);
+                        var writeCount = _tracedGuestWriteCounts.TryGetValue(
+                            target.Address,
+                            out var previousCount)
+                            ? previousCount + 1
+                            : 1;
+                        _tracedGuestWriteCounts[target.Address] = writeCount;
+                        if (writeCount <= (traceSmallWrites ? 48 : 3))
+                        {
+                            _commandBuffer = _presentationCommandBuffer;
+                            Check(
+                                _vk.QueueWaitIdle(_queue),
+                                "vkQueueWaitIdle(guest write trace)");
+                            Console.Error.WriteLine(
+                                $"[LOADER][TRACE] vk.guest_write_sample " +
+                                $"addr=0x{target.Address:X16} write={writeCount} " +
+                                $"ps_bytes={work.Draw.PixelSpirv.Length}");
+                            TraceGuestImageContents(target);
+                        }
                     }
                 }
                 TraceVulkanShader(
-                    $"vk.offscreen_draw addr=0x{target.Address:X16} " +
-                    $"size={target.Width}x{target.Height} format={target.Format} " +
+                    $"vk.offscreen_draw mrt={targets.Length} " +
+                    $"size={firstTarget.Width}x{firstTarget.Height} " +
                     $"textures={work.Draw.Textures.Count}");
             }
             catch (Exception exception)
@@ -4860,19 +5428,22 @@ internal static unsafe class VulkanVideoPresenter
                     return;
                 }
 
-                if (!_guestImages.TryGetValue(work.Target.Address, out var failedTarget) ||
-                    !failedTarget.Initialized)
+                lock (_gate)
                 {
-                    lock (_gate)
+                    foreach (var target in work.Targets)
                     {
-                        _availableGuestImages.Remove(work.Target.Address);
-                        _gpuGuestImages.Remove(work.Target.Address);
+                        if (!_guestImages.TryGetValue(target.Address, out var failedTarget) ||
+                            !failedTarget.Initialized)
+                        {
+                            _availableGuestImages.Remove(target.Address);
+                            _gpuGuestImages.Remove(target.Address);
+                        }
                     }
                 }
 
                 Console.Error.WriteLine(
                     $"[LOADER][ERROR] Vulkan offscreen draw failed " +
-                    $"addr=0x{work.Target.Address:X16}: {exception.Message}");
+                    $"mrt={work.Targets.Count}: {exception.Message}");
             }
             finally
             {
@@ -4889,6 +5460,16 @@ internal static unsafe class VulkanVideoPresenter
                 if (!submitted && resources is not null)
                 {
                     DestroyTranslatedDrawResources(resources);
+                }
+
+                if (transientFramebuffer.Handle != 0)
+                {
+                    _vk.DestroyFramebuffer(_device, transientFramebuffer, null);
+                }
+
+                if (transientRenderPass.Handle != 0)
+                {
+                    _vk.DestroyRenderPass(_device, transientRenderPass, null);
                 }
             }
         }
@@ -4928,6 +5509,8 @@ internal static unsafe class VulkanVideoPresenter
                     return existing;
                 }
 
+                CompletePendingPresentation(wait: true);
+                WaitForAllGuestSubmissions();
                 DestroyGuestImage(existing);
                 _guestImages.Remove(target.Address);
                 lock (_gate)
@@ -5046,35 +5629,55 @@ internal static unsafe class VulkanVideoPresenter
             Format format,
             ImageView attachmentView,
             uint width,
+            uint height) =>
+            CreateRenderPassAndFramebuffer([format], [attachmentView], width, height);
+
+        private (RenderPass RenderPass, Framebuffer Framebuffer) CreateRenderPassAndFramebuffer(
+            IReadOnlyList<Format> formats,
+            IReadOnlyList<ImageView> attachmentViews,
+            uint width,
             uint height)
         {
-            var colorAttachment = new AttachmentDescription
+            if (formats.Count == 0 || formats.Count != attachmentViews.Count)
             {
-                Format = format,
-                Samples = SampleCountFlags.Count1Bit,
-                LoadOp = AttachmentLoadOp.Load,
-                StoreOp = AttachmentStoreOp.Store,
-                StencilLoadOp = AttachmentLoadOp.DontCare,
-                StencilStoreOp = AttachmentStoreOp.DontCare,
-                InitialLayout = ImageLayout.ColorAttachmentOptimal,
-                FinalLayout = ImageLayout.ColorAttachmentOptimal,
-            };
-            var colorReference = new AttachmentReference
+                throw new InvalidOperationException("render target formats and views must have matching counts");
+            }
+
+            var colorAttachments = stackalloc AttachmentDescription[formats.Count];
+            var colorReferences = stackalloc AttachmentReference[formats.Count];
+            var views = stackalloc ImageView[formats.Count];
+            for (var index = 0; index < formats.Count; index++)
             {
-                Attachment = 0,
-                Layout = ImageLayout.ColorAttachmentOptimal,
-            };
+                colorAttachments[index] = new AttachmentDescription
+                {
+                    Format = formats[index],
+                    Samples = SampleCountFlags.Count1Bit,
+                    LoadOp = AttachmentLoadOp.Load,
+                    StoreOp = AttachmentStoreOp.Store,
+                    StencilLoadOp = AttachmentLoadOp.DontCare,
+                    StencilStoreOp = AttachmentStoreOp.DontCare,
+                    InitialLayout = ImageLayout.ColorAttachmentOptimal,
+                    FinalLayout = ImageLayout.ColorAttachmentOptimal,
+                };
+                colorReferences[index] = new AttachmentReference
+                {
+                    Attachment = (uint)index,
+                    Layout = ImageLayout.ColorAttachmentOptimal,
+                };
+                views[index] = attachmentViews[index];
+            }
+
             var subpass = new SubpassDescription
             {
                 PipelineBindPoint = PipelineBindPoint.Graphics,
-                ColorAttachmentCount = 1,
-                PColorAttachments = &colorReference,
+                ColorAttachmentCount = (uint)formats.Count,
+                PColorAttachments = colorReferences,
             };
             var renderPassInfo = new RenderPassCreateInfo
             {
                 SType = StructureType.RenderPassCreateInfo,
-                AttachmentCount = 1,
-                PAttachments = &colorAttachment,
+                AttachmentCount = (uint)formats.Count,
+                PAttachments = colorAttachments,
                 SubpassCount = 1,
                 PSubpasses = &subpass,
             };
@@ -5082,13 +5685,12 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.CreateRenderPass(_device, &renderPassInfo, null, out var renderPass),
                 "vkCreateRenderPass(offscreen)");
 
-            var attachment = attachmentView;
             var framebufferInfo = new FramebufferCreateInfo
             {
                 SType = StructureType.FramebufferCreateInfo,
                 RenderPass = renderPass,
-                AttachmentCount = 1,
-                PAttachments = &attachment,
+                AttachmentCount = (uint)formats.Count,
+                PAttachments = views,
                 Width = width,
                 Height = height,
                 Layers = 1,
@@ -5313,7 +5915,7 @@ internal static unsafe class VulkanVideoPresenter
 
         private void UpdatePerformanceHud()
         {
-            if (!_performanceHudEnabled || !OperatingSystem.IsWindows())
+            if (!_performanceHudEnabled)
             {
                 return;
             }
@@ -5335,28 +5937,34 @@ internal static unsafe class VulkanVideoPresenter
                 var hottestThreadId = 0;
                 var hottestThreadCpuSeconds = 0.0;
 
-                foreach (ProcessThread thread in process.Threads)
+                // Per-thread CPU times and thread names come from Windows-only
+                // APIs; on POSIX the HUD reports process totals with an "idle"
+                // hottest-thread slot.
+                if (OperatingSystem.IsWindows())
                 {
-                    using (thread)
+                    foreach (ProcessThread thread in process.Threads)
                     {
-                        try
+                        using (thread)
                         {
-                            var threadId = thread.Id;
-                            var cpu = thread.TotalProcessorTime;
-                            currentThreadIds.Add(threadId);
-                            currentThreadCpu[threadId] = cpu;
-                            if (_performanceHudThreadCpu.TryGetValue(threadId, out var previousCpu))
+                            try
                             {
-                                var deltaSeconds = Math.Max(0.0, (cpu - previousCpu).TotalSeconds);
-                                if (deltaSeconds > hottestThreadCpuSeconds)
+                                var threadId = thread.Id;
+                                var cpu = thread.TotalProcessorTime;
+                                currentThreadIds.Add(threadId);
+                                currentThreadCpu[threadId] = cpu;
+                                if (_performanceHudThreadCpu.TryGetValue(threadId, out var previousCpu))
                                 {
-                                    hottestThreadCpuSeconds = deltaSeconds;
-                                    hottestThreadId = threadId;
+                                    var deltaSeconds = Math.Max(0.0, (cpu - previousCpu).TotalSeconds);
+                                    if (deltaSeconds > hottestThreadCpuSeconds)
+                                    {
+                                        hottestThreadCpuSeconds = deltaSeconds;
+                                        hottestThreadId = threadId;
+                                    }
                                 }
                             }
-                        }
-                        catch (InvalidOperationException)
-                        {
+                            catch (InvalidOperationException)
+                            {
+                            }
                         }
                     }
                 }
@@ -5526,6 +6134,12 @@ internal static unsafe class VulkanVideoPresenter
 
         private void Render(double _)
         {
+            if (Volatile.Read(ref _presenterCloseRequested))
+            {
+                _window.Close();
+                return;
+            }
+
             if (!_vulkanReady)
             {
                 return;
@@ -5598,6 +6212,7 @@ internal static unsafe class VulkanVideoPresenter
 
             TranslatedDrawResources? translatedResources = null;
             GuestImageResource? presentedGuestImage = null;
+            var tracePresentedGuestImage = false;
             if (presentation.GuestImageAddress != 0 &&
                 (!_guestImages.TryGetValue(
                     presentation.GuestImageAddress,
@@ -5609,13 +6224,13 @@ internal static unsafe class VulkanVideoPresenter
             if (presentedGuestImage is not null)
             {
                 _directPresentationCount++;
-                if (ShouldTracePresentedGuestImageContentsForDiagnostics() &&
-                    _directPresentationCount is 1 or 30 or 120)
+                if (ShouldSamplePresentedGuestImageForDiagnostics(
+                        _directPresentationCount))
                 {
+                    tracePresentedGuestImage = true;
                     Console.Error.WriteLine(
                         $"[LOADER][TRACE] vk.present_sample frame={_directPresentationCount} " +
                         $"addr=0x{presentedGuestImage.Address:X16}");
-                    TraceGuestImageContents(presentedGuestImage);
                 }
             }
 
@@ -5626,7 +6241,7 @@ internal static unsafe class VulkanVideoPresenter
                     translatedResources = CreateTranslatedDrawResources(
                         translatedDraw,
                         _renderPass,
-                        _swapchainFormat,
+                        [_swapchainFormat],
                         _extent);
                     if (ShouldTracePresentedGuestImageContentsForDiagnostics() &&
                         !_firstGuestDrawPresented)
@@ -5803,6 +6418,19 @@ internal static unsafe class VulkanVideoPresenter
                 CompletePendingPresentation(wait: true);
                 TraceSwapchainReadback();
             }
+            // Report the actual presented pixels before starting the larger
+            // source-image readback.  If a guest draw wedges the GPU, the
+            // source probe can block in vkQueueWaitIdle; doing it first used
+            // to hide whether the swapchain itself was black and made the
+            // diagnostic run stop immediately after vk.present_sample.
+            if (tracePresentedGuestImage && presentedGuestImage is not null)
+            {
+                TraceGuestImageContents(presentedGuestImage);
+            }
+            while (_pendingAliasImageDumps.TryDequeue(out var aliasImage))
+            {
+                TraceGuestImageContents(aliasImage);
+            }
             CollectCompletedGuestSubmissions(waitForOldest: false);
 
             _imageInitialized[imageIndex] = true;
@@ -5846,7 +6474,8 @@ internal static unsafe class VulkanVideoPresenter
             var bytesPerPixel = GetReadbackBytesPerPixel(image.Format);
             if (bytesPerPixel == 0)
             {
-                TraceVulkanShader(
+                Console.Error.WriteLine(
+                    "[LOADER][TRACE] " +
                     $"vk.guest_image addr=0x{image.Address:X16} " +
                     $"format={image.Format} readback=unsupported");
                 return;
@@ -5981,7 +6610,8 @@ internal static unsafe class VulkanVideoPresenter
                         (int)bytesPerPixel);
                     var center = Convert.ToHexString(
                         bytes.Slice(centerOffset, (int)bytesPerPixel));
-                    TraceVulkanShader(
+                    Console.Error.WriteLine(
+                        "[LOADER][TRACE] " +
                         $"vk.guest_image addr=0x{image.Address:X16} " +
                         $"size={image.Width}x{image.Height} format={image.Format} " +
                         $"nonzero_bytes={nonzeroBytes}/{byteCount} " +
@@ -6013,9 +6643,10 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             Directory.CreateDirectory(directory);
+            var sequence = Interlocked.Increment(ref _guestImageDumpSequence);
             var path = Path.Combine(
                 directory,
-                $"0x{image.Address:X16}-{image.Width}x{image.Height}-{image.Format}.rgba");
+                $"{sequence:D4}-0x{image.Address:X16}-{image.Width}x{image.Height}-{image.Format}.rgba");
             File.WriteAllBytes(path, bytes.ToArray());
         }
 
@@ -6101,8 +6732,14 @@ internal static unsafe class VulkanVideoPresenter
                     continue;
                 }
 
-                var hasPriorContents = texture.GuestImage is { } guestImage &&
-                    (guestImage.Initialized || guestImage.InitialUploadPending);
+                // InitialUploadPending means this upload still has to perform
+                // the image's first layout transition.  Treating it as prior
+                // contents records ShaderReadOnlyOptimal as oldLayout even
+                // though a freshly created image is still Undefined.  Linux
+                // validation reports VUID-vkCmdDraw-None-09600 and NVIDIA
+                // samples the uninitialized (black) image in that case.
+                var hasPriorContents =
+                    texture.GuestImage is { Initialized: true };
                 var toTransfer = new ImageMemoryBarrier
                 {
                     SType = StructureType.ImageMemoryBarrier,
@@ -6468,6 +7105,11 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var drawViewport = ClampViewport(resources.Viewport, extent);
+            if (ViewportDebugEpsilon != 0f)
+            {
+                drawViewport.X += ViewportDebugEpsilon;
+                drawViewport.Y += ViewportDebugEpsilon;
+            }
             _vk.CmdSetViewport(_commandBuffer, 0, 1, &drawViewport);
             if (resources.VertexBuffers.Length != 0)
             {
@@ -6521,6 +7163,16 @@ internal static unsafe class VulkanVideoPresenter
 
         private void DestroyTranslatedDrawResources(TranslatedDrawResources resources)
         {
+            if (resources.TransientFramebuffer.Handle != 0)
+            {
+                _vk.DestroyFramebuffer(_device, resources.TransientFramebuffer, null);
+            }
+
+            if (resources.TransientRenderPass.Handle != 0)
+            {
+                _vk.DestroyRenderPass(_device, resources.TransientRenderPass, null);
+            }
+
             foreach (var texture in resources.Textures)
             {
                 if (texture is null)
@@ -6693,7 +7345,15 @@ internal static unsafe class VulkanVideoPresenter
             var sourceToTransfer = new ImageMemoryBarrier
             {
                 SType = StructureType.ImageMemoryBarrier,
-                SrcAccessMask = AccessFlags.ShaderReadBit,
+                // An offscreen target is last written as a color attachment,
+                // then put in ShaderReadOnlyOptimal for later sampling.  A
+                // layout-only handoff to ShaderRead does not make that write
+                // visible to this transfer when no shader sample occurs in
+                // between.  NVIDIA's Linux driver exposed the resulting stale
+                // (usually black) image while Windows drivers happened to
+                // tolerate it.  Include all preceding writes before blitting
+                // the image into the swapchain.
+                SrcAccessMask = AccessFlags.MemoryWriteBit | AccessFlags.ShaderReadBit,
                 DstAccessMask = AccessFlags.TransferReadBit,
                 OldLayout = ImageLayout.ShaderReadOnlyOptimal,
                 NewLayout = ImageLayout.TransferSrcOptimal,
@@ -6764,6 +7424,14 @@ internal static unsafe class VulkanVideoPresenter
                     1),
                 DstOffsets = destinationOffsets,
             };
+            // Nearest keeps integer upscales pixel-crisp, but any fractional
+            // scale (e.g. a 3840x2160 guest frame into a 2560x1440 swapchain)
+            // must blend neighbours or it silently drops every Nth source
+            // row/column, which shreds 1-2px features in the guest frame.
+            var isIntegerUpscale =
+                source.Width != 0 && source.Height != 0 &&
+                _extent.Width >= source.Width && _extent.Height >= source.Height &&
+                _extent.Width % source.Width == 0 && _extent.Height % source.Height == 0;
             _vk.CmdBlitImage(
                 _commandBuffer,
                 source.Image,
@@ -6772,7 +7440,7 @@ internal static unsafe class VulkanVideoPresenter
                 ImageLayout.TransferDstOptimal,
                 1,
                 &region,
-                Filter.Nearest);
+                isIntegerUpscale ? Filter.Nearest : Filter.Linear);
 
             if (traceDestination)
             {

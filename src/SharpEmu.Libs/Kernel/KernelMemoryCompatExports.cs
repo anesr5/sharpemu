@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.HLE.Host;
 using SharpEmu.Libs.Ampr;
 using System.Buffers;
 using System.Buffers.Binary;
@@ -17,6 +18,10 @@ public static class KernelMemoryCompatExports
     private const int MaxGuestStringLength = 4096;
     private const int WideCharSize = sizeof(ushort);
     private const int MemsetChunkSize = 16 * 1024;
+    private const int MemcpyChunkSize = 256 * 1024;
+
+    // Shared all-zero scratch for chunked zero-fill loops; never written to.
+    private static readonly byte[] _zeroChunk = new byte[MemsetChunkSize];
     private const int TlsModuleBlockSize = 0x10000;
     private const int O_WRONLY = 0x1;
     private const int O_RDWR = 0x2;
@@ -52,14 +57,13 @@ public static class KernelMemoryCompatExports
     private const ulong FlexibleMemorySizeBytes = 448UL * 1024 * 1024;
     private const int OrbisVirtualQueryInfoSize = 72;
     private const int OrbisKernelMaximumNameLength = 32;
-    private const uint MemCommit = 0x1000;
-    private const uint MemReserve = 0x2000;
-    private const uint MemRelease = 0x8000;
+    // Raw Windows PAGE_* values used only against HostRegionInfo.RawProtection,
+    // which by contract carries the untranslated protection word of the host
+    // platform in use (see IHostMemory).
     private const uint HostPageNoAccess = 0x01;
     private const uint HostPageReadOnly = 0x02;
     private const uint HostPageReadWrite = 0x04;
     private const uint HostPageWriteCopy = 0x08;
-    private const uint HostPageExecute = 0x10;
     private const uint HostPageExecuteRead = 0x20;
     private const uint HostPageExecuteReadWrite = 0x40;
     private const uint HostPageExecuteWriteCopy = 0x80;
@@ -121,6 +125,13 @@ public static class KernelMemoryCompatExports
 
     private static ulong _nextPhysicalAddress;
     private static ulong _nextVirtualAddress;
+    // First guest virtual address handed out for direct/flexible mappings
+    // when the game does not request one. 4GB is free on Windows, but on
+    // POSIX hosts it belongs to the host image / runtime (the Mach-O image
+    // base is 0x100000000 on macOS), so search from a guest-owned window
+    // well clear of host mappings instead.
+    private static readonly ulong DefaultMapSearchBase =
+        OperatingSystem.IsWindows() ? 0x1_0000_0000UL : 0x20_0000_0000UL;
     private static ulong _mainDirectMemoryPoolBase = UnsetMainDirectMemoryPoolBase;
     private static ulong _allocatedFlexibleBytes;
     private static ulong _threadAtexitCountCallback;
@@ -136,31 +147,9 @@ public static class KernelMemoryCompatExports
     private static string? _cachedApp0Root;
     private static string? _cachedDownload0Root;
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MemoryBasicInformation
-    {
-        public nint BaseAddress;
-        public nint AllocationBase;
-        public uint AllocationProtect;
-        public nuint RegionSize;
-        public uint State;
-        public uint Protect;
-        public uint Type;
-    }
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern nuint VirtualQuery(nint lpAddress, out MemoryBasicInformation lpBuffer, nuint dwLength);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool VirtualProtect(nint lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern nint VirtualAlloc(nint lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool VirtualFree(nint lpAddress, nuint dwSize, uint dwFreeType);
+    // Property (not a cached field) so merely touching this type never resolves
+    // the platform backend; non-Windows hosts only throw if a call is reached.
+    private static IHostMemory HostMemory => HostPlatform.Current.Memory;
 
     private sealed class OpenDirectory
     {
@@ -200,6 +189,40 @@ public static class KernelMemoryCompatExports
         }
     }
 
+    public static bool TryUnregisterGuestPathMount(string guestMountPoint)
+    {
+        if (string.IsNullOrWhiteSpace(guestMountPoint))
+        {
+            return false;
+        }
+
+        var normalizedMountPoint = NormalizeGuestStatCachePath(guestMountPoint);
+        if (normalizedMountPoint is null || normalizedMountPoint == "/")
+        {
+            return false;
+        }
+
+        var removed = false;
+        lock (_guestMountGate)
+        {
+            removed = _guestMounts.Remove(normalizedMountPoint);
+        }
+
+        if (!removed)
+        {
+            return false;
+        }
+
+        lock (_statCacheGate)
+        {
+            _negativeStatCache.RemoveWhere(path =>
+                string.Equals(path, normalizedMountPoint, StringComparison.OrdinalIgnoreCase) ||
+                path.StartsWith(normalizedMountPoint + "/", StringComparison.OrdinalIgnoreCase));
+        }
+
+        return true;
+    }
+
     internal static bool TryAllocateHleData(
         CpuContext ctx,
         ulong length,
@@ -225,7 +248,7 @@ public static class KernelMemoryCompatExports
         lock (_memoryGate)
         {
             var desiredAddress = AlignUp(
-                _nextVirtualAddress == 0 ? 0x1_0000_0000UL : _nextVirtualAddress,
+                _nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress,
                 effectiveAlignment);
             if (!TryReserveGuestVirtualRange(ctx, desiredAddress, mappedLength, protection, effectiveAlignment, out address) ||
                 address == 0)
@@ -243,11 +266,10 @@ public static class KernelMemoryCompatExports
                 DirectStart: 0);
         }
 
-        var zeroes = new byte[(int)Math.Min(mappedLength, (ulong)MemsetChunkSize)];
         for (ulong offset = 0; offset < mappedLength;)
         {
-            var chunkLength = (int)Math.Min((ulong)zeroes.Length, mappedLength - offset);
-            if (!ctx.Memory.TryWrite(address + offset, zeroes.AsSpan(0, chunkLength)))
+            var chunkLength = (int)Math.Min((ulong)_zeroChunk.Length, mappedLength - offset);
+            if (!ctx.Memory.TryWrite(address + offset, _zeroChunk.AsSpan(0, chunkLength)))
             {
                 return false;
             }
@@ -410,33 +432,50 @@ public static class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        var chunk = new byte[MemsetChunkSize];
-        Array.Fill(chunk, value);
-        var remaining = length;
-        var cursor = destination;
-        while (remaining > 0)
+        // Rent may hand back a larger array than requested; only the first chunkLength
+        // bytes are filled, so the loop must cap at chunkLength rather than chunk.Length.
+        var chunkLength = (int)Math.Min(length, (ulong)MemsetChunkSize);
+        var chunk = value == 0 ? _zeroChunk : ArrayPool<byte>.Shared.Rent(chunkLength);
+        if (value != 0)
         {
-            var take = (int)Math.Min((ulong)chunk.Length, remaining);
-            if (!TryWriteCompat(ctx, cursor, chunk.AsSpan(0, take)))
+            chunk.AsSpan(0, chunkLength).Fill(value);
+        }
+
+        try
+        {
+            var remaining = length;
+            var cursor = destination;
+            while (remaining > 0)
             {
-                if (length <= 0x40)
+                var take = (int)Math.Min((ulong)chunkLength, remaining);
+                if (!TryWriteCompat(ctx, cursor, chunk.AsSpan(0, take)))
                 {
-                    var recoveryIndex = Interlocked.Increment(ref _inaccessibleMemsetRecoveryCount);
-                    if (recoveryIndex <= 8)
+                    if (length <= 0x40)
                     {
-                        Console.Error.WriteLine(
-                            $"[LOADER][WARNING] memset inaccessible-dst recovery#{recoveryIndex}: rip=0x{ctx.Rip:X16} dst=0x{destination:X16} len=0x{length:X} val=0x{value:X2}");
+                        var recoveryIndex = Interlocked.Increment(ref _inaccessibleMemsetRecoveryCount);
+                        if (recoveryIndex <= 8)
+                        {
+                            Console.Error.WriteLine(
+                                $"[LOADER][WARNING] memset inaccessible-dst recovery#{recoveryIndex}: rip=0x{ctx.Rip:X16} dst=0x{destination:X16} len=0x{length:X} val=0x{value:X2}");
+                        }
+
+                        ctx[CpuRegister.Rax] = destination;
+                        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                     }
 
-                    ctx[CpuRegister.Rax] = destination;
-                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
                 }
 
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                cursor += (ulong)take;
+                remaining -= (ulong)take;
             }
-
-            cursor += (ulong)take;
-            remaining -= (ulong)take;
+        }
+        finally
+        {
+            if (value != 0)
+            {
+                ArrayPool<byte>.Shared.Return(chunk);
+            }
         }
 
         ctx[CpuRegister.Rax] = destination;
@@ -1173,11 +1212,10 @@ public static class KernelMemoryCompatExports
         var rawCount = ctx[CpuRegister.Rdx];
 
         // A garbage/absurd count (observed as e.g. 0xA7560035 from the same still-unidentified
-        // upstream bug that also feeds bad lengths to memset) must not reach
-        // GC.AllocateUninitializedArray: attempting a multi-GB allocation from a guest-thread
-        // call context corrupted the CLR outright ("Invalid Program: attempted to call a
-        // UnmanagedCallersOnly method from managed code") instead of throwing a normal
-        // exception. Reject anything above a sane bound before allocating.
+        // upstream bug that also feeds bad lengths to memset) must not turn into a multi-GB
+        // copy attempt from a guest-thread call context, which corrupted the CLR outright
+        // ("Invalid Program: attempted to call a UnmanagedCallersOnly method from managed
+        // code") instead of throwing a normal exception. Reject anything above a sane bound.
         const ulong maxSaneCount = 512UL * 1024 * 1024;
         if (rawCount > maxSaneCount)
         {
@@ -1186,15 +1224,52 @@ public static class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var count = (int)rawCount;
-        var payload = GC.AllocateUninitializedArray<byte>(count);
-        if (count > 0 && (!TryReadCompat(ctx, source, payload) || !TryWriteCompat(ctx, destination, payload)))
+        ctx[CpuRegister.Rax] = destination;
+        if (rawCount == 0)
         {
-            ctx[CpuRegister.Rax] = destination;
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        ctx[CpuRegister.Rax] = destination;
+        // Cap iterations at the requested chunk size, not chunk.Length: Rent may hand
+        // back a larger array, and the copy granularity should not depend on pool
+        // bucketing internals.
+        var chunkLength = (int)Math.Min(rawCount, (ulong)MemcpyChunkSize);
+        var chunk = ArrayPool<byte>.Shared.Rent(chunkLength);
+        try
+        {
+            // memmove aliases this export, so overlapping ranges must survive the chunked
+            // copy: when the destination starts inside the source range, copy high-to-low
+            // so no source byte is overwritten before it has been read.
+            var copyBackward = destination > source && destination - source < rawCount;
+            var remaining = rawCount;
+            ulong offset = copyBackward ? rawCount : 0;
+            while (remaining > 0)
+            {
+                var take = (int)Math.Min((ulong)chunkLength, remaining);
+                if (copyBackward)
+                {
+                    offset -= (ulong)take;
+                }
+
+                var span = chunk.AsSpan(0, take);
+                if (!TryReadCompat(ctx, source + offset, span) || !TryWriteCompat(ctx, destination + offset, span))
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                if (!copyBackward)
+                {
+                    offset += (ulong)take;
+                }
+
+                remaining -= (ulong)take;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(chunk);
+        }
+
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1820,6 +1895,45 @@ public static class KernelMemoryCompatExports
                 ? (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT
                 : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
+    }
+
+    [SysAbiExport(
+        Nid = "fgIsQ10xYVA",
+        ExportName = "sceKernelChmod",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelChmod(CpuContext ctx)
+    {
+        var pathAddress = ctx[CpuRegister.Rdi];
+        var mode = unchecked((uint)ctx[CpuRegister.Rsi]);
+        if (pathAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!TryReadNullTerminatedUtf8(ctx, pathAddress, MaxGuestStringLength, out var guestPath))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        var hostPath = ResolveGuestPath(guestPath);
+        if (IsReadOnlyGuestMutationPath(guestPath))
+        {
+            LogOpenTrace($"chmod readonly path='{guestPath}' host='{hostPath}' mode=0x{mode:X}");
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED;
+        }
+
+        if (!File.Exists(hostPath) && !Directory.Exists(hostPath))
+        {
+            AddNegativeStatCacheForGuestPath(guestPath);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        // POSIX permission bits have no host equivalent on Windows; accept the call
+        // so guests that chmod their freshly created files/directories can proceed.
+        LogOpenTrace($"chmod path='{guestPath}' host='{hostPath}' mode=0x{mode:X}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -3078,7 +3192,7 @@ public static class KernelMemoryCompatExports
                 ? requestedAddress
                 : directMemoryStart != 0
                     ? AlignUp(directMemoryStart, effectiveAlignment)
-                    : AlignUp(_nextVirtualAddress == 0 ? 0x1_0000_0000UL : _nextVirtualAddress, effectiveAlignment);
+                    : AlignUp(_nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress, effectiveAlignment);
 
             var reserved = false;
             if (fixedMapping && requestedAddress != 0)
@@ -3184,7 +3298,7 @@ public static class KernelMemoryCompatExports
             var fixedMapping = (flags & 0x10UL) != 0;
             var desiredAddress = requestedAddress != 0
                 ? requestedAddress
-                : AlignUp(_nextVirtualAddress == 0 ? 0x1_0000_0000UL : _nextVirtualAddress, 0x1000UL);
+                : AlignUp(_nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress, 0x1000UL);
 
             if (fixedMapping && requestedAddress != 0)
             {
@@ -3529,7 +3643,7 @@ public static class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryProtectHostRange(alignedAddress, alignedLength, protection))
+        if (!TryProtectHostRange(ctx, alignedAddress, alignedLength, protection))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
@@ -3563,7 +3677,7 @@ public static class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (!TryProtectHostRange(alignedAddress, alignedLength, protection))
+        if (!TryProtectHostRange(ctx, alignedAddress, alignedLength, protection))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
@@ -5763,42 +5877,40 @@ public static class KernelMemoryCompatExports
         return alignedLength != 0;
     }
 
-    private static bool TryProtectHostRange(ulong address, ulong length, int orbisProtection)
+    private static bool TryProtectHostRange(CpuContext ctx, ulong address, ulong length, int orbisProtection)
     {
         if (length == 0 || length > nuint.MaxValue)
         {
             return false;
         }
 
-        var hostProtection = ResolveHostProtection(orbisProtection);
-        if (!VirtualProtect((nint)address, (nuint)length, hostProtection, out _))
+        if (!KernelVirtualRangeAllocator.TryResolveAddressSpace(ctx.Memory, out var addressSpace))
         {
             return false;
         }
 
-        return true;
+        return addressSpace.TryProtect(address, length, ResolveGuestProtection(orbisProtection));
     }
 
-    private static uint ResolveHostProtection(int orbisProtection)
+    private static GuestPageProtection ResolveGuestProtection(int orbisProtection)
     {
-        var read = (orbisProtection & (OrbisProtCpuRead | OrbisProtGpuRead)) != 0;
-        var write = (orbisProtection & (OrbisProtCpuWrite | OrbisProtGpuWrite)) != 0;
-        var execute = (orbisProtection & OrbisProtCpuExec) != 0;
-
-        if (execute)
+        var protection = GuestPageProtection.None;
+        if ((orbisProtection & (OrbisProtCpuRead | OrbisProtGpuRead)) != 0)
         {
-            return write
-                ? HostPageExecuteReadWrite
-                : read
-                    ? HostPageExecuteRead
-                    : HostPageExecute;
+            protection |= GuestPageProtection.Read;
         }
 
-        return write
-            ? HostPageReadWrite
-            : read
-                ? HostPageReadOnly
-                : HostPageNoAccess;
+        if ((orbisProtection & (OrbisProtCpuWrite | OrbisProtGpuWrite)) != 0)
+        {
+            protection |= GuestPageProtection.Write;
+        }
+
+        if ((orbisProtection & OrbisProtCpuExec) != 0)
+        {
+            protection |= GuestPageProtection.Execute;
+        }
+
+        return protection;
     }
 
     private static bool TryFindVirtualQueryRegionLocked(ulong queryAddress, bool findNext, out MappedRegion region)
@@ -6086,6 +6198,55 @@ public static class KernelMemoryCompatExports
         return false;
     }
 
+    internal static bool TryReadTrackedLibcHeapGpuAlias(
+        ulong packedAddress,
+        Span<byte> destination)
+    {
+        if (destination.IsEmpty)
+        {
+            return true;
+        }
+
+        // Gen5 texture descriptors retain 46 bits of the byte address.  Host
+        // libc allocations can live at 0x7F... on Linux, so recover the full
+        // tracked allocation address when the descriptor contains its packed
+        // low-bit alias.
+        const ulong textureAddressMask = (1UL << 46) - 1;
+        var length = (ulong)destination.Length;
+        ulong resolvedAddress = 0;
+        lock (_libcAllocGate)
+        {
+            foreach (var (allocationAddress, allocation) in _libcAllocations)
+            {
+                var packedBase = allocationAddress & textureAddressMask;
+                if (packedAddress < packedBase)
+                {
+                    continue;
+                }
+
+                var offset = packedAddress - packedBase;
+                var allocationSize = (ulong)allocation.Size;
+                if (offset > allocationSize || length > allocationSize - offset)
+                {
+                    continue;
+                }
+
+                var candidate = allocationAddress + offset;
+                if (resolvedAddress != 0 && resolvedAddress != candidate)
+                {
+                    // Do not guess if two live host allocations collide after
+                    // descriptor address packing.
+                    return false;
+                }
+
+                resolvedAddress = candidate;
+            }
+
+            return resolvedAddress != 0 &&
+                   TryReadHostMemory(resolvedAddress, destination);
+        }
+    }
+
     private static bool TryAllocateLibcHeap(ulong requestedSize, nuint alignment, bool zeroFill, out ulong address)
     {
         address = 0;
@@ -6184,7 +6345,7 @@ public static class KernelMemoryCompatExports
             var effectiveAlignment = Math.Max(alignment, pageSize);
             var usableSize = checked((nuint)AlignUp((ulong)actualSize, (ulong)pageSize));
             var reservationSize = checked(pageSize + effectiveAlignment - 1 + usableSize + pageSize);
-            var baseAddress = VirtualAlloc(0, reservationSize, MemCommit | MemReserve, HostPageReadWrite);
+            var baseAddress = unchecked((nint)HostMemory.Allocate(0, reservationSize, HostPageProtection.ReadWrite));
             if (baseAddress == 0)
             {
                 return false;
@@ -6192,9 +6353,9 @@ public static class KernelMemoryCompatExports
 
             var alignedAddress = AlignUp(unchecked((ulong)baseAddress) + (ulong)pageSize, (ulong)effectiveAlignment);
             var guardAddress = alignedAddress + (ulong)usableSize;
-            if (!VirtualProtect((nint)guardAddress, pageSize, HostPageNoAccess, out _))
+            if (!HostMemory.Protect(guardAddress, pageSize, HostPageProtection.NoAccess, out _))
             {
-                _ = VirtualFree(baseAddress, 0, MemRelease);
+                _ = HostMemory.Free(unchecked((ulong)baseAddress));
                 return false;
             }
 
@@ -6329,7 +6490,7 @@ public static class KernelMemoryCompatExports
 
         if (allocation.IsGuarded)
         {
-            _ = VirtualFree(allocation.BaseAddress, 0, MemRelease);
+            _ = HostMemory.Free(unchecked((ulong)allocation.BaseAddress));
         }
         else
         {
@@ -6425,7 +6586,7 @@ public static class KernelMemoryCompatExports
             return false;
         }
 
-        if (!TryQueryHostPage(address, out var startInfo) || !HasRequiredProtection(startInfo.Protect, writeAccess))
+        if (!TryQueryHostPage(address, out var startInfo) || !HasRequiredProtection(startInfo.RawProtection, writeAccess))
         {
             return false;
         }
@@ -6436,7 +6597,7 @@ public static class KernelMemoryCompatExports
             return true;
         }
 
-        if (!TryQueryHostPage(endAddress, out var endInfo) || !HasRequiredProtection(endInfo.Protect, writeAccess))
+        if (!TryQueryHostPage(endAddress, out var endInfo) || !HasRequiredProtection(endInfo.RawProtection, writeAccess))
         {
             return false;
         }
@@ -6444,16 +6605,14 @@ public static class KernelMemoryCompatExports
         return true;
     }
 
-    private static bool TryQueryHostPage(ulong address, out MemoryBasicInformation info)
+    private static bool TryQueryHostPage(ulong address, out HostRegionInfo info)
     {
-        info = default;
-        var size = (nuint)Marshal.SizeOf<MemoryBasicInformation>();
-        if (VirtualQuery((nint)address, out info, size) == 0)
+        if (!HostMemory.Query(address, out info))
         {
             return false;
         }
 
-        return info.State == MemCommit;
+        return info.State == HostRegionState.Committed;
     }
 
     private static bool HasRequiredProtection(uint protect, bool writeAccess)
@@ -6946,16 +7105,5 @@ public static class KernelMemoryCompatExports
     {
         sum = left + right;
         return sum >= left;
-    }
-
-    [SysAbiExport(
-        Nid = "KMcEa+rHsIo",
-        ExportName = "sceKernelMapMemory",
-        Target = Generation.Gen4 | Generation.Gen5,
-        LibraryName = "libKernel")]
-    public static int KernelMapMemory(CpuContext ctx)
-    {
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 }

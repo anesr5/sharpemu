@@ -5,6 +5,7 @@ using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
 using SharpEmu.Libs.VideoOut;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
 namespace SharpEmu.Libs.Agc;
@@ -29,6 +30,7 @@ public static class AgcExports
     private const uint ItDispatchDirect = 0x15;
     private const uint ItDispatchIndirect = 0x16;
     private const uint ItWaitRegMem = 0x3C;
+    private const uint ItIndirectBuffer = 0x3F;
     private const uint ItEventWrite = 0x46;
     private const uint ItDmaData = 0x50;
     private const uint ItSetContextReg = 0x69;
@@ -157,7 +159,7 @@ public static class AgcExports
     private static readonly HashSet<uint> _tracedSubmittedDrawOpcodes = new();
     private static readonly Dictionary<(ulong Ps, ulong State, Gen5PixelOutputKind Output), byte[]> _pixelSpirvCache = new();
     private static readonly Dictionary<
-        (ulong Es, ulong EsState, ulong Ps, ulong PsState, Gen5PixelOutputKind Output, uint Attributes),
+        (ulong Es, ulong EsState, ulong Ps, ulong PsState, string OutputLayout, uint Attributes),
         (byte[] Vertex, byte[] Pixel)> _graphicsSpirvCache = new();
     private static readonly Dictionary<
         (ulong Cs, ulong State, uint LocalX, uint LocalY, uint LocalZ),
@@ -1943,6 +1945,96 @@ public static class AgcExports
         return ReturnPointer(ctx, commandAddress);
     }
 
+    // Guest draw-command builders: emit valid (skippable) packets and return a live
+    // command pointer so the guest's command-buffer build succeeds; full draw processing is TODO.
+    [SysAbiExport(
+        Nid = "8N2tmT3jmC8",
+        ExportName = "sceAgcDcbSetIndexCount",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbSetIndexCount(CpuContext ctx)
+    {
+        var dcb = ctx[CpuRegister.Rdi];
+        var indexCount = (uint)ctx[CpuRegister.Rsi];
+        if (dcb == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, dcb, 2, out var cmd) ||
+            !ctx.TryWriteUInt32(cmd, Pm4(2, ItNop, RZero)) ||
+            !ctx.TryWriteUInt32(cmd + 4, indexCount))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, cmd);
+    }
+
+    [SysAbiExport(
+        Nid = "xSAR0LTcRKM",
+        ExportName = "sceAgcDcbJump",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbJump(CpuContext ctx)
+    {
+        var dcb = ctx[CpuRegister.Rdi];
+        var target = ctx[CpuRegister.Rsi];
+        var sizeDwords = (uint)ctx[CpuRegister.Rdx];
+        if (dcb == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, dcb, 4, out var cmd) ||
+            !ctx.TryWriteUInt32(cmd, Pm4(4, ItIndirectBuffer, RZero)) ||
+            !ctx.TryWriteUInt32(cmd + 4, (uint)(target & 0xFFFF_FFFFUL)) ||
+            !ctx.TryWriteUInt32(cmd + 8, (uint)((target >> 32) & 0xFFFFUL)) ||
+            !ctx.TryWriteUInt32(cmd + 12, sizeDwords & 0xFFFFF))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, cmd);
+    }
+
+    [SysAbiExport(
+        Nid = "bbFueFP+J4k",
+        ExportName = "sceAgcDcbSetPredication",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbSetPredication(CpuContext ctx)
+    {
+        var dcb = ctx[CpuRegister.Rdi];
+        var address = ctx[CpuRegister.Rsi];
+        if (dcb == 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, dcb, 3, out var cmd) ||
+            !ctx.TryWriteUInt32(cmd, Pm4(3, ItNop, RZero)) ||
+            !ctx.TryWriteUInt32(cmd + 4, (uint)(address & 0xFFFF_FFFFUL)) ||
+            !ctx.TryWriteUInt32(cmd + 8, (uint)(address >> 32)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, cmd);
+    }
+
+    [SysAbiExport(
+        Nid = "w6Dj1VJt5qY",
+        ExportName = "sceAgcSetPacketPredication",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int SetPacketPredication(CpuContext ctx)
+    {
+        // Global predication toggle on a packet; a no-op is safe for rendering.
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "w2rJhmD+dsE",
         ExportName = "sceAgcDriverAddEqEvent",
@@ -3288,6 +3380,7 @@ public static class AgcExports
                 $"agc.rt_writer seq={drawSequence} target=0x{target.Address:X16} " +
                 $"fmt={target.Format} tile={target.TileMode} " +
                 $"size={target.Width}x{target.Height} vertices={vertexCount} " +
+                $"prim=0x{primitiveType:X} indexed={indexed} " +
                 $"es=0x{(hasExportShader ? exportShaderAddress : 0):X16} " +
                 $"ps=0x{(hasPixelShader ? pixelShaderAddress : 0):X16}");
         }
@@ -3324,17 +3417,20 @@ public static class AgcExports
                     CreateVulkanGuestMemoryBuffers(translatedDraw.GlobalMemoryBindings);
                 var vertexBuffers =
                     CreateVulkanGuestVertexBuffers(translatedDraw.VertexInputs);
+                TraceRectListVertices(translatedDraw, vertexBuffers);
+                TraceGrassDrawVertices(translatedDraw, textures, vertexBuffers);
                 VulkanVideoPresenter.SubmitOffscreenTranslatedDraw(
                     translatedDraw.PixelSpirv,
                     textures,
                     globalMemoryBuffers,
                     translatedDraw.AttributeCount,
-                    new VulkanGuestRenderTarget(
-                        firstTarget.Address,
-                        firstTarget.Width,
-                            firstTarget.Height,
-                            firstTarget.Format,
-                            firstTarget.NumberType),
+                    translatedDraw.RenderTargets.Select(target =>
+                        new VulkanGuestRenderTarget(
+                            target.Address,
+                            target.Width,
+                            target.Height,
+                            target.Format,
+                            target.NumberType)).ToArray(),
                         translatedDraw.VertexSpirv,
                         translatedDraw.VertexCount,
                         translatedDraw.InstanceCount,
@@ -3462,11 +3558,34 @@ public static class AgcExports
         }
 
         var renderTargets = GetRenderTargets(state.CxRegisters)
-            .Where(target =>
-                target.Slot == 0 &&
-                HasPixelColorExport(pixelState, target.Slot))
+            .Where(target => HasPixelColorExport(pixelState, target.Slot))
+            .OrderBy(target => target.Slot)
             .ToArray();
-        var outputKind = GetPixelOutputKind(renderTargets.FirstOrDefault().NumberType);
+        var renderTargetFormats = new VulkanRenderTargetFormat[renderTargets.Length];
+        for (var index = 0; index < renderTargets.Length; index++)
+        {
+            var target = renderTargets[index];
+            if (!VulkanVideoPresenter.TryDecodeRenderTargetFormat(
+                    target.Format,
+                    target.NumberType,
+                    out renderTargetFormats[index]))
+            {
+                error =
+                    $"unsupported color target format={target.Format} number_type={target.NumberType}";
+                return false;
+            }
+        }
+
+        var pixelOutputs = renderTargets
+            .Select((target, location) => new Gen5PixelOutputBinding(
+                target.Slot,
+                (uint)location,
+                renderTargetFormats[location].OutputKind))
+            .ToArray();
+        var outputLayout = string.Join(
+            ';',
+            pixelOutputs.Select(output =>
+                $"{output.GuestSlot}:{output.HostLocation}:{(int)output.Kind}"));
         var attributeCount = GetInterpolatedAttributeCount(pixelState);
         var exportStateFingerprint = ComputeShaderStructureFingerprint(exportEvaluation);
         var pixelStateFingerprint = ComputeShaderStructureFingerprint(pixelEvaluation);
@@ -3475,7 +3594,7 @@ public static class AgcExports
             exportStateFingerprint,
             pixelShaderAddress,
             pixelStateFingerprint,
-            outputKind,
+            outputLayout,
             attributeCount);
         var totalGlobalBuffers =
             pixelEvaluation.GlobalMemoryBindings.Count +
@@ -3491,7 +3610,7 @@ public static class AgcExports
             if (!Gen5SpirvTranslator.TryCompilePixelShader(
                     pixelState,
                     pixelEvaluation,
-                    outputKind,
+                    pixelOutputs,
                     out var pixelShader,
                     out error,
                     globalBufferBase: 0,
@@ -3579,7 +3698,7 @@ public static class AgcExports
             vertexInputs,
             renderTargets,
             ApplyTransparentPremultipliedFillClear(
-                CreateRenderState(state.CxRegisters, renderTargets.FirstOrDefault()),
+                CreateRenderState(state.CxRegisters, renderTargets, pixelState),
                 textures,
                 vertexInputs,
                 pixelEvaluation.InitialScalarRegisters));
@@ -3595,7 +3714,8 @@ public static class AgcExports
     /// Chowdren resets its effect layers with an untextured transparent-black
     /// fill using premultiplied blending. With One/OneMinusSrcAlpha that draw
     /// is otherwise a no-op, causing fog and vignette layers to accumulate.
-    /// Treat precisely that draw shape as an overwrite.
+    /// Treat precisely that draw shape as an overwrite only when every MRT
+    /// attachment uses the same premultiplied blend pattern.
     /// </summary>
     private static VulkanGuestRenderState ApplyTransparentPremultipliedFillClear(
         VulkanGuestRenderState renderState,
@@ -3607,13 +3727,7 @@ public static class AgcExports
             textures.Count != 0 ||
             vertexInputs.Count != 0 ||
             pixelUserData.Count < 4 ||
-            renderState.Blend is not
-            {
-                Enable: true,
-                ColorSrcFactor: 1,
-                ColorDstFactor: 5,
-                ColorFunc: 0,
-            })
+            !renderState.Blends.All(IsTransparentPremultipliedFillBlend))
         {
             return renderState;
         }
@@ -3628,9 +3742,20 @@ public static class AgcExports
 
         return renderState with
         {
-            Blend = renderState.Blend with { Enable = false },
+            Blends = renderState.Blends
+                .Select(blend => blend with { Enable = false })
+                .ToArray(),
         };
     }
+
+    private static bool IsTransparentPremultipliedFillBlend(VulkanGuestBlendState blend) =>
+        blend is
+        {
+            Enable: true,
+            ColorSrcFactor: 1,
+            ColorDstFactor: 5,
+            ColorFunc: 0,
+        };
 
     private static VulkanGuestIndexBuffer? CreateVulkanIndexBuffer(
         CpuContext ctx,
@@ -3654,19 +3779,15 @@ public static class AgcExports
             : null;
     }
 
-    private static Gen5PixelOutputKind GetPixelOutputKind(uint numberType) =>
-        numberType switch
-        {
-            4 => Gen5PixelOutputKind.Uint,
-            5 => Gen5PixelOutputKind.Sint,
-            _ => Gen5PixelOutputKind.Float,
-        };
-
     private static bool HasPixelColorExport(Gen5ShaderState state, uint target) =>
-        state.Program.Instructions.Any(instruction =>
-            instruction.Control is Gen5ExportControl export &&
-            export.Target == target &&
-            export.EnableMask != 0);
+        GetPixelColorExportMask(state, target) != 0;
+
+    private static uint GetPixelColorExportMask(Gen5ShaderState state, uint target) =>
+        state.Program.Instructions
+            .Select(instruction => instruction.Control)
+            .OfType<Gen5ExportControl>()
+            .Where(export => export.Target == target)
+            .Aggregate(0u, (mask, export) => mask | (export.EnableMask & 0xFu));
 
     private static uint GetInterpolatedAttributeCount(Gen5ShaderState state)
     {
@@ -3824,11 +3945,25 @@ public static class AgcExports
 
     private static VulkanGuestRenderState CreateRenderState(
         IReadOnlyDictionary<uint, uint> registers,
-        RenderTargetDescriptor target)
+        IReadOnlyList<RenderTargetDescriptor> targets,
+        Gen5ShaderState pixelState)
     {
+        if (targets.Count == 0)
+        {
+            return VulkanGuestRenderState.Default;
+        }
+
+        var target = targets[0];
         var scissor = DecodeScissor(registers, target.Width, target.Height);
         return new VulkanGuestRenderState(
-            DecodeBlendState(registers, target.Slot),
+            targets.Select(target =>
+            {
+                var blend = DecodeBlendState(registers, target.Slot);
+                return blend with
+                {
+                    WriteMask = blend.WriteMask & GetPixelColorExportMask(pixelState, target.Slot),
+                };
+            }).ToArray(),
             scissor,
             DecodeViewport(registers, target.Width, target.Height, scissor));
     }
@@ -3853,7 +3988,7 @@ public static class AgcExports
             (control >> 24) & 0x1Fu,
             (control >> 21) & 0x7u,
             ((control >> 29) & 1u) != 0,
-            writeMask == 0 ? 0xFu : writeMask);
+            writeMask);
     }
 
     private static VulkanGuestRect? DecodeScissor(
@@ -4250,6 +4385,7 @@ public static class AgcExports
             descriptor.Width > 8192 ||
             descriptor.Height > 8192)
         {
+            TraceTextureFallback(descriptor, "invalid-descriptor");
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
             return true;
         }
@@ -4267,6 +4403,9 @@ public static class AgcExports
             sourceByteCount > MaxPresentedTextureBytes ||
             sourceByteCount > int.MaxValue)
         {
+            TraceTextureFallback(
+                descriptor,
+                $"invalid-byte-count:{sourceByteCount}");
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
             return true;
         }
@@ -4302,7 +4441,10 @@ public static class AgcExports
             if (descriptor.Address != 0)
             {
                 var storageSource = new byte[(int)sourceByteCount];
-                if (ctx.Memory.TryRead(descriptor.Address, storageSource) &&
+                if ((ctx.Memory.TryRead(descriptor.Address, storageSource) ||
+                     KernelMemoryCompatExports.TryReadTrackedLibcHeapGpuAlias(
+                         descriptor.Address,
+                         storageSource)) &&
                     storageSource.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
                 {
                     initialPixels = storageSource;
@@ -4328,8 +4470,14 @@ public static class AgcExports
         }
 
         var source = new byte[(int)sourceByteCount];
-        if (!ctx.Memory.TryRead(descriptor.Address, source))
+        if (!ctx.Memory.TryRead(descriptor.Address, source) &&
+            !KernelMemoryCompatExports.TryReadTrackedLibcHeapGpuAlias(
+                descriptor.Address,
+                source))
         {
+            TraceTextureFallback(
+                descriptor,
+                $"guest-read-failed:{sourceByteCount}");
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
             return true;
         }
@@ -4355,6 +4503,7 @@ public static class AgcExports
             $"size={descriptor.Width}x{descriptor.Height} pitch={descriptor.Pitch} " +
             $"dst=0x{descriptor.DstSelect:X3} " +
             $"bytes={source.Length} nonzero64={nonZero}");
+        DumpTextureSourceIfRequested(descriptor, sourceWidth, source);
 
         var rgba = source;
         texture = new VulkanGuestDrawTexture(
@@ -4373,6 +4522,158 @@ public static class AgcExports
             DstSelect: descriptor.DstSelect,
             Sampler: ToVulkanSampler(samplerDescriptor));
         return true;
+    }
+
+    private static int _textureFallbackTraceCount;
+
+    private static void TraceTextureFallback(
+        TextureDescriptor descriptor,
+        string reason)
+    {
+        var mode = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGES");
+        if ((!string.Equals(mode, "1", StringComparison.Ordinal) &&
+             !string.Equals(mode, "present", StringComparison.OrdinalIgnoreCase)) ||
+            Interlocked.Increment(ref _textureFallbackTraceCount) > 64)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] agc.texture_fallback reason={reason} " +
+            $"addr=0x{descriptor.Address:X16} type={descriptor.Type} " +
+            $"size={descriptor.Width}x{descriptor.Height} pitch={descriptor.Pitch} " +
+            $"fmt={descriptor.Format} num={descriptor.NumberType} " +
+            $"tile={descriptor.TileMode} mip={descriptor.MipLevels} " +
+            $"dst=0x{descriptor.DstSelect:X3}");
+    }
+
+
+
+    private static int _grassTraceCount;
+
+    private static void TraceGrassDrawVertices(
+        TranslatedGuestDraw draw,
+        IReadOnlyList<VulkanGuestDrawTexture> textures,
+        IReadOnlyList<VulkanGuestVertexBuffer> vertexBuffers)
+    {
+        if (_grassTraceCount >= 6 ||
+            !textures.Any(texture => texture.Width == 288 && texture.Height == 160) ||
+            vertexBuffers.Count == 0 ||
+            Interlocked.Increment(ref _grassTraceCount) > 6)
+        {
+            return;
+        }
+
+        var text = new System.Text.StringBuilder();
+        text.Append($"agc.grassdraw prim=0x{draw.PrimitiveType:X} verts={draw.VertexCount} ");
+        text.Append($"indexed={draw.IndexBuffer is not null} buffers={vertexBuffers.Count}");
+        foreach (var buffer in vertexBuffers)
+        {
+            text.Append(
+                $"\n  loc={buffer.Location} fmt={buffer.DataFormat}/{buffer.NumberFormat}x{buffer.ComponentCount} " +
+                $"stride={buffer.Stride} offset={buffer.OffsetBytes} bytes={buffer.Data.Length}");
+            var stride = Math.Max(buffer.Stride, 4u);
+            var maxVerts = Math.Min(6, (int)((buffer.Data.Length - buffer.OffsetBytes) / stride));
+            for (var vertex = 0; vertex < maxVerts; vertex++)
+            {
+                var baseOffset = (int)(buffer.OffsetBytes + vertex * stride);
+                var components = Math.Min(4, (int)((buffer.Data.Length - baseOffset) / 4));
+                text.Append($"\n    v{vertex}:");
+                for (var c = 0; c < components; c++)
+                {
+                    text.Append($" {BitConverter.ToSingle(buffer.Data, baseOffset + c * 4):0.#####}");
+                }
+            }
+        }
+
+        TraceAgcShader(text.ToString());
+    }
+
+    private static int _rectListTraceCount;
+
+    private static void TraceRectListVertices(
+        TranslatedGuestDraw draw,
+        IReadOnlyList<VulkanGuestVertexBuffer> vertexBuffers)
+    {
+        if (draw.PrimitiveType != 0x11 ||
+            draw.IndexBuffer is not null ||
+            vertexBuffers.Count == 0 ||
+            _rectListTraceCount >= 8 ||
+            Interlocked.Increment(ref _rectListTraceCount) > 8)
+        {
+            return;
+        }
+
+        var buffer = vertexBuffers[0];
+        var stride = Math.Max(buffer.Stride, 4u);
+        var text = new System.Text.StringBuilder();
+        for (var vertex = 0; vertex < 3; vertex++)
+        {
+            var baseOffset = (int)(buffer.OffsetBytes + vertex * stride);
+            if (baseOffset + 16 > buffer.Data.Length)
+            {
+                break;
+            }
+
+            var x = BitConverter.ToSingle(buffer.Data, baseOffset);
+            var y = BitConverter.ToSingle(buffer.Data, baseOffset + 4);
+            var z = BitConverter.ToSingle(buffer.Data, baseOffset + 8);
+            var w = BitConverter.ToSingle(buffer.Data, baseOffset + 12);
+            text.Append($" v{vertex}=({x:0.###},{y:0.###},{z:0.###},{w:0.###})");
+        }
+
+        TraceAgcShader(
+            $"agc.rectlist verts={draw.VertexCount} stride={buffer.Stride} " +
+            $"fmt={buffer.DataFormat}/{buffer.NumberFormat}x{buffer.ComponentCount}{text}");
+    }
+
+    private static int _textureDumpCount;
+    private static readonly ConcurrentDictionary<string, int> _textureDumpKeys = new();
+
+    /// <summary>
+    /// Writes raw sampled-texture bytes (as read from guest memory) when
+    /// SHARPEMU_TEXTURE_DUMP_DIR is set, so upload-time content can be
+    /// inspected offline. File name records size and effective pitch.
+    /// </summary>
+    private static void DumpTextureSourceIfRequested(
+        in TextureDescriptor descriptor,
+        uint sourcePitch,
+        byte[] source)
+    {
+        var directory = Environment.GetEnvironmentVariable("SHARPEMU_TEXTURE_DUMP_DIR");
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            return;
+        }
+
+        var key = $"0x{descriptor.Address:X}-{descriptor.Width}x{descriptor.Height}";
+        var occurrence = _textureDumpKeys.AddOrUpdate(key, 1, static (_, count) => count + 1);
+        // First uses plus periodic later snapshots (the game reuses the same
+        // allocation for successive full-screen images).
+        if ((occurrence > 3 && occurrence % 500 >= 3) ||
+            Interlocked.Increment(ref _textureDumpCount) > 200)
+        {
+            return;
+        }
+
+        var index = _textureDumpCount;
+
+        try
+        {
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(
+                directory,
+                $"{index:D3}-0x{descriptor.Address:X}-{descriptor.Width}x{descriptor.Height}" +
+                $"-p{sourcePitch}-f{descriptor.Format}-t{descriptor.TileMode}.bin");
+            File.WriteAllBytes(path, source);
+        }
+        catch (Exception exception)
+        {
+            // A bad SHARPEMU_TEXTURE_DUMP_DIR (permissions, invalid path)
+            // must not take the emulator down; the dump is a debug aid.
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] Texture dump failed: {exception.Message}");
+        }
     }
 
     private static VulkanGuestDrawTexture CreateFallbackGuestDrawTexture(
@@ -5191,7 +5492,7 @@ public static class AgcExports
                         if (Gen5SpirvTranslator.TryCompilePixelShader(
                                  pixelState,
                                  evaluation,
-                                 Gen5PixelOutputKind.Float,
+                                 [new(0, 0, Gen5PixelOutputKind.Float)],
                                  out var compiledPixel,
                                  out var compileError))
                         {

@@ -164,6 +164,17 @@ public static class KernelPthreadExtendedCompatExports
         }
     }
 
+    private sealed class RwlockWaiter : IGuestThreadBlockWaiter
+    {
+        public required PthreadRwlockState Rwlock { get; init; }
+        public required ulong ThreadId { get; init; }
+        public required bool Write { get; init; }
+
+        public int Resume() => (int)OrbisGen2Result.ORBIS_GEN2_OK;
+
+        public bool TryWake() => TryAcquireBlockedRwlock(Rwlock, ThreadId, Write);
+    }
+
     private readonly record struct TlsKeyState(ulong Destructor);
 
     private readonly record struct PthreadAttrState(
@@ -376,6 +387,47 @@ public static class KernelPthreadExtendedCompatExports
                 SchedPolicy = policy,
                 SchedPriority = schedPriority,
             };
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "oIRFTjoILbg",
+        ExportName = "scePthreadSetschedparam",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadSetschedparam(CpuContext ctx) => PosixPthreadSetschedparam(ctx);
+
+    [SysAbiExport(
+        Nid = "P41kTWUS3EI",
+        ExportName = "scePthreadGetschedparam",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadGetschedparam(CpuContext ctx)
+    {
+        var thread = ctx[CpuRegister.Rdi];
+        var outPolicyAddress = ctx[CpuRegister.Rsi];
+        var outSchedParamAddress = ctx[CpuRegister.Rdx];
+        if (thread == 0 || outPolicyAddress == 0 || outSchedParamAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        int policy;
+        int priority;
+        lock (_stateGate)
+        {
+            var state = GetOrCreateThreadStateLocked(thread);
+            policy = state.Attributes.SchedPolicy;
+            priority = state.Priority;
+        }
+
+        if (!ctx.TryWriteInt32(outPolicyAddress, policy) ||
+            !ctx.TryWriteInt32(outSchedParamAddress, priority))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -1318,8 +1370,7 @@ public static class KernelPthreadExtendedCompatExports
                             ctx,
                             "pthread_rwlock_wrlock",
                             rwlock.WakeKey,
-                            static () => (int)OrbisGen2Result.ORBIS_GEN2_OK,
-                            () => TryAcquireBlockedRwlock(rwlock, currentThreadId, write: true)))
+                            new RwlockWaiter { Rwlock = rwlock, ThreadId = currentThreadId, Write = true }))
                     {
                         transferredToScheduler = true;
                         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -1355,8 +1406,7 @@ public static class KernelPthreadExtendedCompatExports
                             ctx,
                             "pthread_rwlock_rdlock",
                             rwlock.WakeKey,
-                            static () => (int)OrbisGen2Result.ORBIS_GEN2_OK,
-                            () => TryAcquireBlockedRwlock(rwlock, currentThreadId, write: false)))
+                            new RwlockWaiter { Rwlock = rwlock, ThreadId = currentThreadId, Write = false }))
                     {
                         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
                     }
