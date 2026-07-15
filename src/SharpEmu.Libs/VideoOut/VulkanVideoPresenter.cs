@@ -204,6 +204,12 @@ internal static unsafe class VulkanVideoPresenter
     private static long _enqueuedGuestWorkSequence;
     private static long _completedGuestWorkSequence;
 
+    internal static long EnqueuedGuestWorkSequence =>
+        Interlocked.Read(ref _enqueuedGuestWorkSequence);
+
+    internal static long CompletedGuestWorkSequence =>
+        Interlocked.Read(ref _completedGuestWorkSequence);
+
     private static bool ShouldTracePresentedGuestImageContentsForDiagnostics()
     {
         var mode = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGES");

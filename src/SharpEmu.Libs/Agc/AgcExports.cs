@@ -192,6 +192,18 @@ public static class AgcExports
     private static long _standardDmaTraceCount;
     private static readonly object _softwarePresenterGate = new();
     private static readonly Dictionary<(ulong Source, ulong Destination), ulong> _softwarePresenterFingerprints = new();
+    private static readonly object _textureSourceGate = new();
+    private static readonly Dictionary<(ulong Address, int ByteCount), CachedTextureSource> _textureSourceCache = new();
+    private static byte[] _textureSourceScratch = [];
+    private static long _textureSourceCacheBytes;
+    private const long MaxTextureSourceCacheBytes = 512L * 1024 * 1024;
+
+    private sealed class CachedTextureSource
+    {
+        public byte[] Pixels = [];
+        public ulong Fingerprint;
+        public long LastUseSequence;
+    }
     private static readonly Dictionary<(ulong Shader, ulong Source, ulong Destination), ulong> _softwareComputeBlitFingerprints = new();
     private static readonly object _registerDefaultsGate = new();
     private static readonly ConditionalWeakTable<object, RegisterDefaultsAllocation> _registerDefaultsAllocations = new();
@@ -4463,17 +4475,11 @@ public static class AgcExports
         if (isStorage)
         {
             var initialPixels = Array.Empty<byte>();
-            if (descriptor.Address != 0)
+            if (descriptor.Address != 0 &&
+                TryReadGuestTextureSource(ctx, descriptor.Address, (int)sourceByteCount, out var storageSource) &&
+                storageSource.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
             {
-                var storageSource = GC.AllocateUninitializedArray<byte>((int)sourceByteCount);
-                if ((ctx.Memory.TryRead(descriptor.Address, storageSource) ||
-                     KernelMemoryCompatExports.TryReadTrackedLibcHeapGpuAlias(
-                         descriptor.Address,
-                         storageSource)) &&
-                    storageSource.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
-                {
-                    initialPixels = storageSource;
-                }
+                initialPixels = storageSource;
             }
 
             texture = new VulkanGuestDrawTexture(
@@ -4494,11 +4500,7 @@ public static class AgcExports
             return true;
         }
 
-        var source = GC.AllocateUninitializedArray<byte>((int)sourceByteCount);
-        if (!ctx.Memory.TryRead(descriptor.Address, source) &&
-            !KernelMemoryCompatExports.TryReadTrackedLibcHeapGpuAlias(
-                descriptor.Address,
-                source))
+        if (!TryReadGuestTextureSource(ctx, descriptor.Address, (int)sourceByteCount, out var source))
         {
             TraceTextureFallback(
                 descriptor,
@@ -4556,6 +4558,74 @@ public static class AgcExports
             DstSelect: descriptor.DstSelect,
             Sampler: ToVulkanSampler(samplerDescriptor));
         return true;
+    }
+
+    private static bool TryReadGuestTextureSource(
+        CpuContext ctx,
+        ulong address,
+        int byteCount,
+        out byte[] source)
+    {
+        lock (_textureSourceGate)
+        {
+            if (_textureSourceScratch.Length < byteCount)
+            {
+                _textureSourceScratch = GC.AllocateUninitializedArray<byte>(byteCount);
+            }
+
+            var scratch = _textureSourceScratch.AsSpan(0, byteCount);
+            if (!ctx.Memory.TryRead(address, scratch) &&
+                !KernelMemoryCompatExports.TryReadTrackedLibcHeapGpuAlias(address, scratch))
+            {
+                source = [];
+                return false;
+            }
+
+            var fingerprint = ComputeFingerprint(scratch);
+            var key = (address, byteCount);
+            if (_textureSourceCache.TryGetValue(key, out var cached))
+            {
+                if (cached.Fingerprint == fingerprint)
+                {
+                    cached.LastUseSequence =
+                        VulkanVideoPresenter.EnqueuedGuestWorkSequence + 1;
+                    source = cached.Pixels;
+                    return true;
+                }
+
+                if (VulkanVideoPresenter.CompletedGuestWorkSequence >= cached.LastUseSequence)
+                {
+                    scratch.CopyTo(cached.Pixels);
+                    cached.Fingerprint = fingerprint;
+                    cached.LastUseSequence =
+                        VulkanVideoPresenter.EnqueuedGuestWorkSequence + 1;
+                    source = cached.Pixels;
+                    return true;
+                }
+            }
+
+            source = GC.AllocateUninitializedArray<byte>(byteCount);
+            scratch.CopyTo(source);
+            if (_textureSourceCache.Remove(key, out var evicted))
+            {
+                _textureSourceCacheBytes -= evicted.Pixels.Length;
+            }
+
+            if (_textureSourceCacheBytes + byteCount > MaxTextureSourceCacheBytes)
+            {
+                _textureSourceCache.Clear();
+                _textureSourceCacheBytes = 0;
+            }
+
+            _textureSourceCache[key] = new CachedTextureSource
+            {
+                Pixels = source,
+                Fingerprint = fingerprint,
+                LastUseSequence = VulkanVideoPresenter.EnqueuedGuestWorkSequence + 1,
+            };
+            _textureSourceCacheBytes += byteCount;
+            return true;
+        }
     }
 
     private static int _textureFallbackTraceCount;
