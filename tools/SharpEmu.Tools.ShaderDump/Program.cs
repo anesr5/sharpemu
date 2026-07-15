@@ -259,7 +259,6 @@ foreach (var (name, expectTranslate, words) in testPrograms)
         evaluationType,
         new uint[256],
         new uint[256],
-        new Dictionary<uint, IReadOnlyList<uint>>(),
         Array.CreateInstance(imageBindingType, 0),
         globalBindings,
         null,
